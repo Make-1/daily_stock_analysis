@@ -303,36 +303,34 @@ class StockTrendAnalyzer:
 
     def _calculate_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算 RSI 指标
+        计算 RSI 指标（Wilder 平滑法，与富途/通达信/同花顺一致）
 
         公式：
-        - RS = 平均上涨幅度 / 平均下跌幅度
+        - 首个均值：前 N 日的简单平均
+        - 之后递归：avg_t = (avg_{t-1} * (N-1) + value_t) / N      ← Wilder/SMMA
+        - RS  = 平均上涨幅度 / 平均下跌幅度
         - RSI = 100 - (100 / (1 + RS))
+
+        说明：之前使用普通 SMA 会与行情软件偏差 2~6 点，现已切换到
+        Wilder 平滑，结果对齐主流券商/行情软件。
         """
         df = df.copy()
 
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
         for period in [self.RSI_SHORT, self.RSI_MID, self.RSI_LONG]:
-            # 计算价格变化
-            delta = df['close'].diff()
+            # Wilder 平滑等价于 alpha = 1/period 的指数加权移动平均
+            # adjust=False 保证递推公式与 Wilder 完全一致
+            avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+            avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
-            # 分离上涨和下跌
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-
-            # 计算平均涨跌幅
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
-
-            # 计算 RS 和 RSI
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
+            rsi = rsi.fillna(50)
 
-            # 填充 NaN 值
-            rsi = rsi.fillna(50)  # 默认中性值
-
-            # 添加到 DataFrame
-            col_name = f'RSI_{period}'
-            df[col_name] = rsi
+            df[f'RSI_{period}'] = rsi
 
         return df
     
@@ -514,31 +512,31 @@ class StockTrendAnalyzer:
         is_crossing_up = prev_zero <= 0 and curr_zero > 0
         is_crossing_down = prev_zero >= 0 and curr_zero < 0
 
-        # 判断 MACD 状态
+        # 判断 MACD 状态（signal 保持纯文本，符号统一在 _generate_signal 中拼装）
         if is_golden_cross and curr_zero > 0:
             result.macd_status = MACDStatus.GOLDEN_CROSS_ZERO
-            result.macd_signal = "⭐ 零轴上金叉，强烈买入信号！"
+            result.macd_signal = "零轴上金叉，强烈买入信号"
         elif is_crossing_up:
             result.macd_status = MACDStatus.CROSSING_UP
-            result.macd_signal = "⚡ DIF上穿零轴，趋势转强"
+            result.macd_signal = "DIF上穿零轴，趋势转强"
         elif is_golden_cross:
             result.macd_status = MACDStatus.GOLDEN_CROSS
-            result.macd_signal = "✅ 金叉，趋势向上"
+            result.macd_signal = "金叉，趋势向上"
         elif is_death_cross:
             result.macd_status = MACDStatus.DEATH_CROSS
-            result.macd_signal = "❌ 死叉，趋势向下"
+            result.macd_signal = "死叉，趋势向下"
         elif is_crossing_down:
             result.macd_status = MACDStatus.CROSSING_DOWN
-            result.macd_signal = "⚠️ DIF下穿零轴，趋势转弱"
+            result.macd_signal = "DIF下穿零轴，趋势转弱"
         elif result.macd_dif > 0 and result.macd_dea > 0:
             result.macd_status = MACDStatus.BULLISH
-            result.macd_signal = "✓ 多头排列，持续上涨"
+            result.macd_signal = "多头排列，持续上涨"
         elif result.macd_dif < 0 and result.macd_dea < 0:
             result.macd_status = MACDStatus.BEARISH
-            result.macd_signal = "⚠ 空头排列，持续下跌"
+            result.macd_signal = "空头排列，持续下跌"
         else:
             result.macd_status = MACDStatus.BULLISH
-            result.macd_signal = " MACD 中性区域"
+            result.macd_signal = "MACD 中性区域"
 
     def _analyze_rsi(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -563,22 +561,22 @@ class StockTrendAnalyzer:
         # 以中期 RSI(12) 为主进行判断
         rsi_mid = result.rsi_12
 
-        # 判断 RSI 状态
+        # 判断 RSI 状态（signal 保持纯文本，符号统一在 _generate_signal 中拼装）
         if rsi_mid > self.RSI_OVERBOUGHT:
             result.rsi_status = RSIStatus.OVERBOUGHT
-            result.rsi_signal = f"⚠️ RSI超买({rsi_mid:.1f}>70)，短期回调风险高"
+            result.rsi_signal = f"RSI超买({rsi_mid:.1f}>70)，短期回调风险高"
         elif rsi_mid > 60:
             result.rsi_status = RSIStatus.STRONG_BUY
-            result.rsi_signal = f"✅ RSI强势({rsi_mid:.1f})，多头力量充足"
+            result.rsi_signal = f"RSI强势({rsi_mid:.1f})，多头力量充足"
         elif rsi_mid >= 40:
             result.rsi_status = RSIStatus.NEUTRAL
-            result.rsi_signal = f" RSI中性({rsi_mid:.1f})，震荡整理中"
+            result.rsi_signal = f"RSI中性({rsi_mid:.1f})，震荡整理中"
         elif rsi_mid >= self.RSI_OVERSOLD:
             result.rsi_status = RSIStatus.WEAK
-            result.rsi_signal = f"⚡ RSI弱势({rsi_mid:.1f})，关注反弹"
+            result.rsi_signal = f"RSI弱势({rsi_mid:.1f})，关注反弹"
         else:
             result.rsi_status = RSIStatus.OVERSOLD
-            result.rsi_signal = f"⭐ RSI超卖({rsi_mid:.1f}<30)，反弹机会大"
+            result.rsi_signal = f"RSI超卖({rsi_mid:.1f}<30)，反弹机会大"
 
     def _generate_signal(self, result: TrendAnalysisResult) -> None:
         """
@@ -699,12 +697,17 @@ class StockTrendAnalyzer:
         macd_score = macd_scores.get(result.macd_status, 5)
         score += macd_score
 
-        if result.macd_status in [MACDStatus.GOLDEN_CROSS_ZERO, MACDStatus.GOLDEN_CROSS]:
+        if result.macd_status in [
+            MACDStatus.GOLDEN_CROSS_ZERO,
+            MACDStatus.GOLDEN_CROSS,
+            MACDStatus.CROSSING_UP,
+            MACDStatus.BULLISH,
+        ]:
             reasons.append(f"✅ {result.macd_signal}")
-        elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN]:
+        elif result.macd_status in [MACDStatus.DEATH_CROSS, MACDStatus.CROSSING_DOWN, MACDStatus.BEARISH]:
             risks.append(f"⚠️ {result.macd_signal}")
         else:
-            reasons.append(result.macd_signal)
+            reasons.append(f"✅ {result.macd_signal}")
 
         # === RSI 评分（10分）===
         rsi_scores = {
@@ -722,7 +725,7 @@ class StockTrendAnalyzer:
         elif result.rsi_status == RSIStatus.OVERBOUGHT:
             risks.append(f"⚠️ {result.rsi_signal}")
         else:
-            reasons.append(result.rsi_signal)
+            reasons.append(f"✅ {result.rsi_signal}")
 
         # === 综合判断 ===
         result.signal_score = score

@@ -92,6 +92,13 @@ class SystemConfigService:
         reset_fetcher_manager()
         reset_search_service()
 
+        # 美股筛选调度器：根据最新配置热重载（启用/禁用 + 时间变更）
+        try:
+            from src.services.us_screener_scheduler import get_us_screener_scheduler
+            get_us_screener_scheduler().apply_config()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("US screener scheduler reload failed: %s", exc)
+
     @classmethod
     def _normalize_display_value(cls, key: str, value: str) -> str:
         alias_map = cls._DISPLAY_VALUE_ALIASES.get(key.upper())

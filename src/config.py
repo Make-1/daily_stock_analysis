@@ -656,6 +656,16 @@ class Config:
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
+    # === 美股 Top N 筛选 + 飞书推送 ===
+    # 启用后会在 --schedule 模式下，每工作日按 US_SCREENER_SCHEDULE_TIME 运行一次美股筛选
+    us_screener_enabled: bool = False
+    us_screener_schedule_time: str = "11:00"            # 触发时间（本地时区，HH:MM）
+    us_screener_top_n: int = 10                          # 推送前 N 名
+    us_screener_workers: int = 8                          # 并发线程数
+    us_screener_history_days: int = 90                    # 拉取日线天数
+    # 自定义美股候选池（逗号分隔），为空则使用内置默认池
+    us_screener_universe: List[str] = field(default_factory=list)
+
     # === 实时行情增强数据配置 ===
     # 实时行情开关（关闭后使用历史收盘价进行分析）
     enable_realtime_quote: bool = True
@@ -1253,6 +1263,26 @@ class Config:
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
             ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
+            # === 美股 Top N 筛选 + 飞书推送 ===
+            us_screener_enabled=os.getenv('US_SCREENER_ENABLED', 'false').lower() == 'true',
+            us_screener_schedule_time=os.getenv('US_SCREENER_SCHEDULE_TIME', '11:00'),
+            us_screener_top_n=parse_env_int(
+                os.getenv('US_SCREENER_TOP_N'), 10,
+                field_name='US_SCREENER_TOP_N', minimum=1, maximum=50,
+            ),
+            us_screener_workers=parse_env_int(
+                os.getenv('US_SCREENER_WORKERS'), 8,
+                field_name='US_SCREENER_WORKERS', minimum=1, maximum=32,
+            ),
+            us_screener_history_days=parse_env_int(
+                os.getenv('US_SCREENER_HISTORY_DAYS'), 90,
+                field_name='US_SCREENER_HISTORY_DAYS', minimum=30, maximum=720,
+            ),
+            us_screener_universe=[
+                c.strip().upper()
+                for c in os.getenv('US_SCREENER_UNIVERSE', '').split(',')
+                if c.strip()
+            ],
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=parse_env_int(os.getenv('WEBUI_PORT'), 8000, field_name='WEBUI_PORT', minimum=1, maximum=65535),

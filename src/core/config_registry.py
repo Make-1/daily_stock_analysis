@@ -1348,6 +1348,90 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 12,
     },
+    "US_SCREENER_ENABLED": {
+        "title": "美股筛选定时任务",
+        "description": "启用后每工作日在指定时间自动筛选美股 Top N 并推送飞书；保存即生效（无需重启）。",
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 13,
+    },
+    "US_SCREENER_SCHEDULE_TIME": {
+        "title": "美股筛选执行时间",
+        "description": "每工作日触发时间（24 小时制 HH:MM，本机时区）。",
+        "category": "system",
+        "data_type": "time",
+        "ui_control": "time",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "11:00",
+        "options": [],
+        "validation": {"pattern": r"^([01]\d|2[0-3]):[0-5]\d$"},
+        "display_order": 14,
+    },
+    "US_SCREENER_TOP_N": {
+        "title": "美股筛选 Top N",
+        "description": "每次推送的前 N 名（1-50）。",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "10",
+        "options": [],
+        "validation": {"min": 1, "max": 50},
+        "display_order": 15,
+    },
+    "US_SCREENER_WORKERS": {
+        "title": "美股筛选并发线程",
+        "description": "并发拉取日线的线程数（1-32）。",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "8",
+        "options": [],
+        "validation": {"min": 1, "max": 32},
+        "display_order": 16,
+    },
+    "US_SCREENER_HISTORY_DAYS": {
+        "title": "美股筛选日线天数",
+        "description": "拉取的日线历史天数（30-720）。",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "90",
+        "options": [],
+        "validation": {"min": 30, "max": 720},
+        "display_order": 17,
+    },
+    "US_SCREENER_UNIVERSE": {
+        "title": "美股候选池（可选）",
+        "description": "自定义候选美股代码（逗号分隔，如 AAPL,NVDA,TSLA）；留空则使用内置的 77 只大盘龙头默认池。",
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 18,
+    },
     "MARKET_REVIEW_ENABLED": {
         "title": "Market Review Enabled",
         "description": "Enable market overview/review in analysis reports.",
@@ -1764,6 +1848,26 @@ def _extract_option_values(options: List[Any]) -> List[str]:
     return values
 
 
+def _format_default_for_display(default_value: Any, data_type: str) -> str:
+    """格式化默认值用于在 UI description 中展示。"""
+    if default_value is None or default_value == "":
+        return "（默认：未设置）"
+    if data_type == "boolean":
+        # 兼容字符串/布尔值
+        truthy = str(default_value).strip().lower() in ("true", "1", "yes", "on")
+        return f"（默认：{'开启' if truthy else '关闭'}）"
+    return f"（默认：{default_value}）"
+
+
+def _append_default_hint(field: Dict[str, Any]) -> None:
+    """在 description 末尾追加默认值提示（幂等）。"""
+    desc = str(field.get("description") or "").rstrip()
+    if "（默认：" in desc or "(default:" in desc.lower():
+        return
+    hint = _format_default_for_display(field.get("default_value"), field.get("data_type", "string"))
+    field["description"] = f"{desc} {hint}".strip() if desc else hint
+
+
 def get_field_definition(key: str, value_hint: Optional[str] = None) -> Dict[str, Any]:
     """Return field definition for key, including inferred fallback metadata."""
     key_upper = key.upper()
@@ -1775,6 +1879,7 @@ def get_field_definition(key: str, value_hint: Optional[str] = None) -> Dict[str
         if field.get("ui_control") == "select" and option_values and "enum" not in validation:
             validation["enum"] = option_values
         field["validation"] = validation
+        _append_default_hint(field)
         return field
 
     category = _infer_category(key_upper)
@@ -1794,6 +1899,7 @@ def get_field_definition(key: str, value_hint: Optional[str] = None) -> Dict[str
         "validation": {},
         "display_order": 9000,
     }
+    _append_default_hint(field)
     return field
 
 

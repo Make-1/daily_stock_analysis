@@ -69,6 +69,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --us-screen        # 立即运行美股 Top N 筛选并推送飞书
         '''
     )
 
@@ -125,6 +126,19 @@ def parse_arguments() -> argparse.Namespace:
         '--market-review',
         action='store_true',
         help='仅运行大盘复盘分析'
+    )
+
+    parser.add_argument(
+        '--us-screen',
+        action='store_true',
+        help='立即运行美股技术面筛选，并将 Top N 推送到飞书'
+    )
+
+    parser.add_argument(
+        '--us-screen-top',
+        type=int,
+        default=None,
+        help='美股筛选返回的 Top N（默认读取 US_SCREENER_TOP_N，未配置则 10）'
     )
 
     parser.add_argument(
@@ -581,6 +595,15 @@ def main() -> int:
     if bot_clients_started:
         start_bot_stream_clients(config)
 
+    # === 后台调度器：美股筛选定时任务 ===
+    # 仅在 Web 常驻模式下启动；阻塞式 --schedule 模式由下方独立分支处理
+    if start_serve:
+        try:
+            from src.services.us_screener_scheduler import get_us_screener_scheduler
+            get_us_screener_scheduler().start()
+        except Exception as exc:
+            logger.error("启动美股筛选后台调度器失败: %s", exc)
+
     # === 仅 Web 服务模式：不自动执行分析 ===
     if args.serve_only:
         logger.info("模式: 仅 Web 服务")
@@ -672,6 +695,30 @@ def main() -> int:
             )
             return 0
 
+        # 模式1.5: 仅运行美股筛选并推送飞书
+        if getattr(args, 'us_screen', False):
+            logger.info("模式: 美股技术面筛选 + 飞书推送")
+            try:
+                from src.services.us_screener_service import USScreenerService
+
+                service = USScreenerService(config=config)
+                top_n = args.us_screen_top if args.us_screen_top else None
+                items = service.run(
+                    top_n=top_n,
+                    send_notification=not args.no_notify,
+                )
+                logger.info("美股筛选完成: 返回 %d 只", len(items))
+                for i, it in enumerate(items, start=1):
+                    logger.info(
+                        " #%d %s 评分=%d 信号=%s 趋势=%s 现价=%.2f",
+                        i, it.code, it.signal_score, it.buy_signal,
+                        it.trend_status, it.current_price,
+                    )
+            except Exception as exc:
+                logger.exception("美股筛选执行失败: %s", exc)
+                return 1
+            return 0
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
@@ -691,6 +738,33 @@ def main() -> int:
 
             def scheduled_task():
                 run_full_analysis(config, args, scheduled_stock_codes)
+
+            # === 美股 Top N 筛选定时任务（每工作日早上推送到飞书） ===
+            if getattr(config, 'us_screener_enabled', False):
+                try:
+                    import schedule as _schedule
+                    from src.services.us_screener_service import USScreenerService
+
+                    us_time = getattr(config, 'us_screener_schedule_time', '11:00')
+
+                    def us_screener_task():
+                        try:
+                            logger.info("[USScreener] 定时任务触发 (time=%s)", us_time)
+                            service = USScreenerService(config=config)
+                            service.run(send_notification=not args.no_notify)
+                        except Exception as exc:
+                            logger.exception("[USScreener] 定时任务执行失败: %s", exc)
+
+                    # 周一至周五均在指定时间执行
+                    _schedule.every().monday.at(us_time).do(us_screener_task)
+                    _schedule.every().tuesday.at(us_time).do(us_screener_task)
+                    _schedule.every().wednesday.at(us_time).do(us_screener_task)
+                    _schedule.every().thursday.at(us_time).do(us_screener_task)
+                    _schedule.every().friday.at(us_time).do(us_screener_task)
+                    logger.info("已注册美股 Top%d 筛选定时任务: 每工作日 %s",
+                                getattr(config, 'us_screener_top_n', 10), us_time)
+                except Exception as exc:
+                    logger.error("注册美股筛选定时任务失败: %s", exc)
 
             run_with_schedule(
                 task=scheduled_task,
