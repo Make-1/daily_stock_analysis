@@ -1,6 +1,10 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
 
+// 美股筛选当前实现是同步阻塞调用：后端会顺序拉取 ~160 只股票的日线并计算指标，
+// 在国内访问 yfinance 大约需要 60~180 秒；全局 axios 默认 30s 不够，单独放宽。
+const US_SCREENER_RUN_TIMEOUT_MS = 300000;
+
 export type ScreenerItem = {
   code: string;
   signalScore: number;
@@ -68,6 +72,7 @@ export const usScreenerApi = {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/us-screener/run',
       payload,
+      { timeout: US_SCREENER_RUN_TIMEOUT_MS },
     );
     return toCamelCase<ScreenerRunResult>(response.data);
   },

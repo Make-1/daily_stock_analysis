@@ -1,6 +1,7 @@
 import type React from 'react';
 import { Badge } from '../common';
-import { getCategoryDescriptionZh, getCategoryTitleZh } from '../../utils/systemConfigI18n';
+import { useUiLanguage } from '../../contexts/UiLanguageContext';
+import { getCategoryDescription, getCategoryTitle } from '../../utils/systemConfigI18n';
 import type { SystemConfigCategorySchema, SystemConfigItem } from '../../types/systemConfig';
 import { cn } from '../../utils/cn';
 
@@ -17,29 +18,31 @@ export const SettingsCategoryNav: React.FC<SettingsCategoryNavProps> = ({
   activeCategory,
   onSelect,
 }) => {
+  const { language, t } = useUiLanguage();
+
   return (
-    <div className="h-full rounded-[1.5rem] border settings-border bg-card p-4 shadow-soft-card-strong">
+    <div className="h-full rounded-[1.5rem] border settings-border bg-card/94 p-4 shadow-soft-card-strong backdrop-blur-sm">
       <div className="mb-4">
-        <p className="settings-accent-text text-xs font-semibold uppercase tracking-[0.3em]">配置分类</p>
-        <p className="mt-1 text-[11px] leading-relaxed text-muted-text">按模块整理系统设置与认证能力。</p>
+        <p className="settings-accent-text text-xs font-semibold uppercase tracking-[0.3em]">{t('settings.categoryNavTitle')}</p>
+        <p className="mt-1 text-[11px] leading-relaxed text-muted-text">{t('settings.categoryNavDescription')}</p>
       </div>
 
       <div className="space-y-2.5">
         {categories.map((category) => {
           const isActive = category.category === activeCategory;
           const count = (itemsByCategory[category.category] || []).length;
-          const title = getCategoryTitleZh(category.category, category.title);
-          const description = getCategoryDescriptionZh(category.category, category.description);
+          const title = getCategoryTitle(category.category, category.title, language);
+          const description = getCategoryDescription(category.category, category.description, language);
 
           return (
             <button
               key={category.category}
               type="button"
               className={cn(
-                'w-full rounded-[1.1rem] border px-3 py-3 text-left transition-all duration-200',
+                'w-full rounded-[1.1rem] border px-3 py-3 text-left transition-[background-color,border-color,box-shadow,transform] duration-200',
                 isActive
-                  ? 'settings-accent-badge-soft settings-shadow-accent'
-                  : 'settings-border settings-surface hover:settings-border-strong hover:settings-surface-hover',
+                  ? 'settings-nav-item-active'
+                  : 'border-[var(--settings-border)] bg-[var(--settings-surface)] hover:border-[hsl(var(--primary)/0.32)] hover:bg-[hsl(var(--primary)/0.045)]',
               )}
               onClick={() => onSelect(category.category)}
             >
@@ -55,7 +58,7 @@ export const SettingsCategoryNav: React.FC<SettingsCategoryNavProps> = ({
                 <Badge
                   variant={isActive ? 'info' : 'default'}
                   size="sm"
-                  className={isActive ? 'settings-accent-badge' : 'settings-border settings-surface-hover text-muted-text'}
+                  className={isActive ? 'settings-accent-badge border-[hsl(var(--primary)/0.36)]' : 'border-[var(--settings-border)] bg-[var(--settings-surface-hover)] text-muted-text'}
                 >
                   {count}
                 </Badge>

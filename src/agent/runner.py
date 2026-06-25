@@ -19,12 +19,15 @@ import json
 import logging
 import re
 import time
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.tools.registry import ToolRegistry
+from src.agent.stock_scope import StockScope
+from src.llm.usage import should_persist_usage_telemetry
 from src.storage import persist_llm_usage as _persist_usage
 
 logger = logging.getLogger(__name__)
@@ -155,6 +158,52 @@ def _is_non_retriable_tool_result(result: Any) -> bool:
         and bool(result.get("error"))
         and result.get("retriable") is False
     )
+
+
+def _is_stock_scoped_tool(tool_registry: ToolRegistry, tool_name: str) -> bool:
+    tool_def = tool_registry.resolve(tool_name)
+    if tool_def is None:
+        return False
+    return any(param.name == "stock_code" for param in tool_def.parameters)
+
+
+def _normalize_guard_stock_code(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    raw = value if isinstance(value, str) else str(value)
+    normalized = _normalize_tool_stock_code(raw)
+    return normalized if isinstance(normalized, str) else str(normalized)
+
+
+def _guard_tool_stock_scope(tool_registry: ToolRegistry, tool_name: str, arguments: Dict[str, Any], stock_scope: Optional[StockScope]) -> Optional[Dict[str, Any]]:
+    if stock_scope is None or not isinstance(arguments, dict):
+        return None
+    if not _is_stock_scoped_tool(tool_registry, tool_name):
+        return None
+    if "stock_code" not in arguments:
+        return None
+
+    requested = _normalize_guard_stock_code(arguments.get("stock_code"))
+
+    expected = _normalize_guard_stock_code(stock_scope.expected_stock_code)
+    allowed = {
+        normalized
+        for code in stock_scope.allowed_stock_codes
+        for normalized in [_normalize_guard_stock_code(code)]
+        if normalized
+    }
+    if requested and (requested == expected or requested in allowed):
+        return None
+
+    return {
+        "error": "stock_scope_violation",
+        "expected_stock_code": expected,
+        "requested_stock_code": requested,
+        "allowed_stock_codes": sorted(allowed),
+        "retriable": False,
+    }
 
 
 def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
@@ -324,6 +373,35 @@ def _build_timeout_result(
     )
 
 
+def _build_budget_guard_result(
+    *,
+    start_time: float,
+    step: int,
+    tool_calls_log: List[Dict[str, Any]],
+    total_tokens: int,
+    provider_used: str,
+    models_used: List[str],
+    messages: List[Dict[str, Any]],
+    remaining_timeout_s: float,
+    min_step_budget_s: float,
+) -> RunLoopResult:
+    elapsed = time.time() - start_time
+    return RunLoopResult(
+        success=False,
+        content="",
+        tool_calls_log=tool_calls_log,
+        total_steps=step,
+        total_tokens=total_tokens,
+        provider=provider_used,
+        models_used=models_used,
+        error=(
+            "Agent step skipped due to insufficient budget: "
+            f"{remaining_timeout_s:.2f}s remaining, minimum {min_step_budget_s:.1f}s required"
+        ),
+        messages=messages,
+    )
+
+
 # ============================================================
 # Core loop
 # ============================================================
@@ -338,6 +416,7 @@ def run_agent_loop(
     thinking_labels: Optional[Dict[str, str]] = None,
     max_wall_clock_seconds: Optional[float] = None,
     tool_call_timeout_seconds: Optional[float] = None,
+    stock_scope: Optional[StockScope] = None,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -370,10 +449,44 @@ def run_agent_loop(
     provider_used = ""
     models_used: List[str] = []
 
+    # Minimum seconds needed for a meaningful LLM round-trip.  If the
+    # remaining budget is positive but below this threshold, the step will
+    # almost certainly timeout mid-call, wasting a billed request.  Only
+    # enforced from step 2 onwards so the first step always gets a chance
+    # even when the total budget is small.
+    _MIN_STEP_BUDGET_S = 8.0
+
     for step in range(max_steps):
         remaining_timeout = _remaining_timeout_seconds(start_time, max_wall_clock_seconds)
-        if remaining_timeout is not None and remaining_timeout <= 0:
-            logger.warning("Agent timed out before step %d", step + 1)
+        timeout_exhausted = remaining_timeout is not None and remaining_timeout <= 0
+        budget_guard_triggered = (
+            not timeout_exhausted
+            and remaining_timeout is not None
+            and step > 0
+            and remaining_timeout <= _MIN_STEP_BUDGET_S
+        )
+        if timeout_exhausted or budget_guard_triggered:
+            if budget_guard_triggered:
+                logger.warning(
+                    "Agent budget too low for step %d (%.1fs remaining, min %.1fs)",
+                    step + 1,
+                    remaining_timeout,
+                    _MIN_STEP_BUDGET_S,
+                )
+                return _build_budget_guard_result(
+                    start_time=start_time,
+                    step=step,
+                    tool_calls_log=tool_calls_log,
+                    total_tokens=total_tokens,
+                    provider_used=provider_used,
+                    models_used=models_used,
+                    messages=messages,
+                    remaining_timeout_s=remaining_timeout,
+                    min_step_budget_s=_MIN_STEP_BUDGET_S,
+                )
+
+            if remaining_timeout <= 0:
+                logger.warning("Agent timed out before step %d", step + 1)
             return _build_timeout_result(
                 start_time=start_time,
                 max_wall_clock_seconds=float(max_wall_clock_seconds),
@@ -409,7 +522,7 @@ def run_agent_loop(
         if m and m != "error":
             models_used.append(m)
         model_for_usage = m or response.provider
-        if model_for_usage and model_for_usage != "error" and response.usage:
+        if model_for_usage and model_for_usage != "error" and should_persist_usage_telemetry(response.usage):
             _persist_usage(response.usage, model_for_usage, call_type="agent")
 
         remaining_timeout = _remaining_timeout_seconds(start_time, max_wall_clock_seconds)
@@ -438,11 +551,14 @@ def run_agent_loop(
             assistant_msg: Dict[str, Any] = {
                 "role": "assistant",
                 "content": response.content,
+                "_trace_provider": response.provider,
+                "_trace_model": m,
                 "tool_calls": [
                     {
                         "id": tc.id,
                         "name": tc.name,
                         "arguments": tc.arguments,
+                        **({"provider_specific_fields": tc.provider_specific_fields} if tc.provider_specific_fields else {}),
                         **({"thought_signature": tc.thought_signature} if tc.thought_signature is not None else {}),
                     }
                     for tc in response.tool_calls
@@ -450,6 +566,8 @@ def run_agent_loop(
             }
             if response.reasoning_content is not None:
                 assistant_msg["reasoning_content"] = response.reasoning_content
+            if response.provider_blocks:
+                assistant_msg["provider_blocks"] = response.provider_blocks
             messages.append(assistant_msg)
 
             # Execute tools (parallel when > 1)
@@ -467,6 +585,7 @@ def run_agent_loop(
                 tool_calls_log,
                 non_retriable_tool_results,
                 tool_wait_timeout_seconds=effective_tool_timeout,
+                stock_scope=stock_scope,
             )
 
             # Append tool results preserving original call order
@@ -532,7 +651,7 @@ def run_agent_loop(
         total_tokens=total_tokens,
         provider=provider_used,
         models_used=models_used,
-        error=f"Agent exceeded max steps ({max_steps})",
+        error=f"Agent exceeded max steps ({max_steps}). Try increasing AGENT_MAX_STEPS if analysis tasks are complex.",
         messages=messages,
     )
 
@@ -549,6 +668,7 @@ def _execute_tools(
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
+    stock_scope: Optional[StockScope] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
 
@@ -558,6 +678,20 @@ def _execute_tools(
     def _exec_single(tc_item):
         t0 = time.time()
         cache_key = _build_tool_cache_key(tc_item.name, tc_item.arguments)
+        guard_result = _guard_tool_stock_scope(tool_registry, tc_item.name, tc_item.arguments, stock_scope)
+        if guard_result is not None:
+            dur = round(time.time() - t0, 2)
+            result_str = serialize_tool_result(guard_result)
+            if cache_key and non_retriable_tool_results is not None:
+                non_retriable_tool_results[cache_key] = result_str
+            logger.warning(
+                "Tool '%s' blocked by stock scope: requested=%s expected=%s allowed=%s",
+                tc_item.name,
+                guard_result.get("requested_stock_code"),
+                guard_result.get("expected_stock_code"),
+                guard_result.get("allowed_stock_codes"),
+            )
+            return tc_item, result_str, False, dur, False, guard_result
 
         if cache_key and non_retriable_tool_results is not None and cache_key in non_retriable_tool_results:
             dur = round(time.time() - t0, 2)
@@ -566,7 +700,7 @@ def _execute_tools(
                 tc_item.name,
                 tc_item.arguments,
             )
-            return tc_item, non_retriable_tool_results[cache_key], False, dur, True
+            return tc_item, non_retriable_tool_results[cache_key], False, dur, True, None
 
         try:
             res = tool_registry.execute(tc_item.name, **tc_item.arguments)
@@ -579,7 +713,7 @@ def _execute_tools(
             ok = False
             logger.warning("Tool '%s' failed: %s", tc_item.name, e)
         dur = round(time.time() - t0, 2)
-        return tc_item, res_str, ok, dur, False
+        return tc_item, res_str, ok, dur, False, None
 
     results: List[Dict[str, Any]] = []
 
@@ -590,10 +724,11 @@ def _execute_tools(
         timeout_triggered = False
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
             pool = ThreadPoolExecutor(max_workers=1)
+            ctx = contextvars.copy_context()
             try:
-                future = pool.submit(_exec_single, tc)
+                future = pool.submit(ctx.run, _exec_single, tc)
                 try:
-                    _, result_str, success, dur, cached = future.result(timeout=tool_wait_timeout_seconds)
+                    _, result_str, success, dur, cached, guard_result = future.result(timeout=tool_wait_timeout_seconds)
                 except FuturesTimeoutError:
                     timeout_triggered = True
                     future.cancel()
@@ -606,10 +741,11 @@ def _execute_tools(
                     success = False
                     dur = round(tool_wait_timeout_seconds, 2)
                     cached = False
+                    guard_result = None
             finally:
                 pool.shutdown(wait=not timeout_triggered, cancel_futures=timeout_triggered)
         else:
-            _, result_str, success, dur, cached = _exec_single(tc)
+            _, result_str, success, dur, cached, guard_result = _exec_single(tc)
         if progress_callback:
             progress_callback({"type": "tool_done", "step": step, "tool": tc.name, "success": success, "duration": dur})
         log_entry = {
@@ -623,6 +759,13 @@ def _execute_tools(
                     log_entry["timeout"] = True
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+        if guard_result is not None:
+            log_entry.update({
+                "guarded": True,
+                "expected_stock_code": guard_result.get("expected_stock_code"),
+                "requested_stock_code": guard_result.get("requested_stock_code"),
+                "allowed_stock_codes": guard_result.get("allowed_stock_codes", []),
+            })
         tool_calls_log.append(log_entry)
         results.append({"tc": tc, "result_str": result_str})
     else:
@@ -633,21 +776,29 @@ def _execute_tools(
         pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
         timeout_triggered = False
         try:
-            futures = {pool.submit(_exec_single, tc): tc for tc in tool_calls}
+            futures = {pool.submit(contextvars.copy_context().run, _exec_single, tc): tc for tc in tool_calls}
             pending = set(futures)
             for future in as_completed(
                 futures,
                 timeout=tool_wait_timeout_seconds if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 else None,
             ):
                 pending.discard(future)
-                tc_item, result_str, success, dur, cached = future.result()
+                tc_item, result_str, success, dur, cached, guard_result = future.result()
                 if progress_callback:
                     progress_callback({"type": "tool_done", "step": step, "tool": tc_item.name, "success": success, "duration": dur})
-                tool_calls_log.append({
+                log_entry = {
                     "step": step, "tool": tc_item.name, "arguments": tc_item.arguments,
                     "success": success, "duration": dur, "result_length": len(result_str),
                     "cached": cached,
-                })
+                }
+                if guard_result is not None:
+                    log_entry.update({
+                        "guarded": True,
+                        "expected_stock_code": guard_result.get("expected_stock_code"),
+                        "requested_stock_code": guard_result.get("requested_stock_code"),
+                        "allowed_stock_codes": guard_result.get("allowed_stock_codes", []),
+                    })
+                tool_calls_log.append(log_entry)
                 results.append({"tc": tc_item, "result_str": result_str})
         except FuturesTimeoutError:
             timeout_triggered = True
