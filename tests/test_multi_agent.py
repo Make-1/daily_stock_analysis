@@ -16,7 +16,7 @@ import sys
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -35,6 +35,9 @@ from src.agent.protocols import (
     StageResult,
     StageStatus,
 )
+from src.agent.stock_scope import StockScope, resolve_stock_scope
+from src.config import AGENT_MAX_STEPS_DEFAULT, Config
+from src.storage import DatabaseManager
 
 
 # ============================================================
@@ -138,6 +141,29 @@ class TestExtractStockCode(unittest.TestCase):
     def test_common_word_trend(self):
         self.assertEqual(_extract_stock_code("the TREND is up"), "")
 
+    def test_finance_abbrev_excluded(self):
+        for text in [
+            "TTM",
+            "市盈率 TTM 怎么看",
+            "PE 怎么看",
+            "PE TTM",
+            "WHAT IS PE",
+            "PE IS HIGH",
+            "WHAT IS TTM",
+            "YOY",
+            "QOQ",
+            "EBITDA",
+            "DCF",
+            "CAGR",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(_extract_stock_code(text), "")
+
+    def test_finance_abbrev_before_real_ticker(self):
+        self.assertEqual(_extract_stock_code("PE AAPL 怎么看"), "AAPL")
+        self.assertEqual(_extract_stock_code("TTM AAPL 怎么看"), "AAPL")
+        self.assertEqual(_extract_stock_code("WHAT IS PE AAPL"), "AAPL")
+
     # --- Priority: A-share > HK > US ---
 
     def test_a_share_takes_priority_over_us(self):
@@ -162,8 +188,252 @@ class TestExtractStockCode(unittest.TestCase):
 
     def test_common_words_set_completeness(self):
         """Ensure critical finance terms are in _COMMON_WORDS."""
-        expected_in_set = {"BUY", "SELL", "HOLD", "ETF", "IPO", "RSI", "MACD", "STOCK", "TREND"}
+        expected_in_set = {
+            "BUY", "SELL", "HOLD", "ETF", "IPO", "RSI", "MACD", "STOCK", "TREND",
+            "TTM", "PE", "YOY", "QOQ", "EBITDA", "DCF", "CAGR", "KDJ",
+            "IS", "WHAT", "HIGH",
+        }
         self.assertTrue(expected_in_set.issubset(_COMMON_WORDS))
+
+
+# ============================================================
+# Stock scope resolution
+# ============================================================
+
+class TestStockScopeResolution(unittest.TestCase):
+    """Validate chat stock-scope state transitions."""
+
+    def test_maintain_keeps_current_stock_for_finance_abbrev_followup(self):
+        result = resolve_stock_scope(
+            "如果不考虑 TTM 呢",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "maintain")
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+        self.assertEqual(result.effective_context["stock_name"], "匿名标的")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519"})
+
+    def test_switch_clears_old_stock_context_fields(self):
+        result = resolve_stock_scope(
+            "换成 AAPL 看看",
+            {
+                "stock_code": "600519",
+                "stock_name": "匿名标的",
+                "previous_analysis_summary": {"summary": "old"},
+                "previous_strategy": {"action": "hold"},
+                "previous_price": 1800,
+                "previous_change_pct": 1.2,
+                "realtime_quote": {"price": 1800},
+                "analysis_context_pack_summary": "old pack",
+                "report_language": "zh",
+            },
+        )
+
+        self.assertEqual(result.stock_scope.mode, "switch")
+        self.assertEqual(result.stock_scope.expected_stock_code, "AAPL")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"AAPL"})
+        self.assertEqual(result.effective_context["stock_code"], "AAPL")
+        self.assertEqual(result.effective_context["stock_name"], "")
+        self.assertEqual(result.effective_context["report_language"], "zh")
+        for stale_key in (
+            "previous_analysis_summary",
+            "previous_strategy",
+            "previous_price",
+            "previous_change_pct",
+            "realtime_quote",
+            "analysis_context_pack_summary",
+        ):
+            self.assertNotIn(stale_key, result.effective_context)
+
+    def test_switch_allows_single_new_code_when_current_code_is_mentioned(self):
+        result = resolve_stock_scope(
+            "换成 AAPL 看看，不考虑 600519",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "switch")
+        self.assertEqual(result.stock_scope.expected_stock_code, "AAPL")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"AAPL"})
+        self.assertEqual(result.effective_context["stock_code"], "AAPL")
+        self.assertEqual(result.effective_context["stock_name"], "")
+
+    def test_compare_allows_multiple_codes_without_polluting_current_context(self):
+        result = resolve_stock_scope(
+            "比较 600519 和 AAPL",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "compare")
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+        self.assertEqual(result.effective_context["stock_name"], "匿名标的")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "AAPL"})
+
+    def test_compare_allows_plain_five_digit_hk_code(self):
+        result = resolve_stock_scope(
+            "比较 01810 和 AAPL",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "compare")
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+        self.assertEqual(result.effective_context["stock_name"], "匿名标的")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "HK01810", "AAPL"})
+
+    def test_compare_hints_allow_multiple_codes_without_switching_context(self):
+        cases = [
+            "分析 600519 和 AAPL 的差异",
+            "AAPL 相比 600519 怎么样",
+            "和 AAPL 的差异怎么看",
+        ]
+
+        for message in cases:
+            with self.subTest(message=message):
+                result = resolve_stock_scope(
+                    message,
+                    {"stock_code": "600519", "stock_name": "匿名标的"},
+                )
+
+                self.assertEqual(result.stock_scope.mode, "compare")
+                self.assertEqual(result.effective_context["stock_code"], "600519")
+                self.assertEqual(result.effective_context["stock_name"], "匿名标的")
+                self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "AAPL"})
+
+    def test_multiple_explicit_codes_are_compare_scope(self):
+        cases = [
+            ("AAPL 和 TSLA 哪个更值得买", {"600519", "AAPL", "TSLA"}),
+            ("AAPL 和 TSLA 谁更适合", {"600519", "AAPL", "TSLA"}),
+            ("分析 AAPL 和 TSLA", {"600519", "AAPL", "TSLA"}),
+        ]
+
+        for message, expected_allowed in cases:
+            with self.subTest(message=message):
+                result = resolve_stock_scope(
+                    message,
+                    {"stock_code": "600519", "stock_name": "匿名标的"},
+                )
+
+                self.assertEqual(result.stock_scope.mode, "compare")
+                self.assertEqual(result.effective_context["stock_code"], "600519")
+                self.assertEqual(result.effective_context["stock_name"], "匿名标的")
+                self.assertEqual(result.stock_scope.allowed_stock_codes, expected_allowed)
+
+    def test_multiple_lowercase_explicit_codes_are_compare_scope_with_choice_hint(self):
+        result = resolve_stock_scope(
+            "aapl 和 tsla 哪个更值得买",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "compare")
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "AAPL", "TSLA"})
+
+    def test_single_stock_difference_phrase_still_switches_context(self):
+        result = resolve_stock_scope(
+            "分析 AAPL 的差异化优势",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "switch")
+        self.assertEqual(result.stock_scope.expected_stock_code, "AAPL")
+        self.assertEqual(result.effective_context["stock_code"], "AAPL")
+        self.assertEqual(result.effective_context["stock_name"], "")
+
+    def test_moving_average_indicator_token_does_not_switch_context(self):
+        cases = [
+            "分析 MA 均线",
+            "看看 MA 怎么排列",
+            "分析 KDJ 指标",
+            "KDJ 怎么看",
+        ]
+
+        for message in cases:
+            with self.subTest(message=message):
+                result = resolve_stock_scope(
+                    message,
+                    {"stock_code": "600519", "stock_name": "匿名标的"},
+                )
+
+                self.assertEqual(result.stock_scope.mode, "maintain")
+                self.assertEqual(result.stock_scope.expected_stock_code, "600519")
+                self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519"})
+                self.assertEqual(result.effective_context["stock_code"], "600519")
+
+    def test_dotted_us_ticker_stays_intact_in_scope_resolution(self):
+        result = resolve_stock_scope(
+            "比较 BRK.B 和 AAPL",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "compare")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "BRK.B", "AAPL"})
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+
+    def test_invalid_context_exchange_token_is_not_trusted_as_current_stock(self):
+        result = resolve_stock_scope(
+            "继续看",
+            {"stock_code": "HK", "stock_name": "港股"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "maintain")
+        self.assertEqual(result.stock_scope.expected_stock_code, "")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, set())
+        self.assertNotIn("stock_code", result.effective_context)
+        self.assertNotIn("stock_name", result.effective_context)
+
+    def test_compare_does_not_treat_exchange_affixes_as_standalone_tickers(self):
+        cases = [
+            ("比较 01810 和 AAPL", {"600519", "HK01810", "AAPL"}, set()),
+            ("比较 1810.HK 和 AAPL", {"600519", "HK01810", "AAPL"}, {"HK"}),
+            ("比较 0700.HK 和 600519", {"600519", "HK00700"}, {"HK"}),
+            ("比较 600519.SH 和 AAPL", {"600519", "AAPL"}, {"SH"}),
+            ("比较 000001.SZ 和 AAPL", {"600519", "000001", "AAPL"}, {"SZ"}),
+            ("比较 600519.SS 和 AAPL", {"600519", "AAPL"}, {"SS"}),
+            ("比较 1810.hk 和 tsla", {"600519", "HK01810", "TSLA"}, {"HK"}),
+            ("比较 SH600519 和 AAPL", {"600519", "AAPL"}, {"SH"}),
+            ("比较 SZ000001 和 AAPL", {"600519", "000001", "AAPL"}, {"SZ"}),
+            ("比较 BJ920748 和 AAPL", {"600519", "920748", "AAPL"}, {"BJ"}),
+            ("比较 HK01810 和 AAPL", {"600519", "HK01810", "AAPL"}, {"HK"}),
+            ("比较 hk01810 和 tsla", {"600519", "HK01810", "TSLA"}, {"HK"}),
+            ("比较 600519 SH 和 AAPL", {"600519", "AAPL"}, {"SH"}),
+            ("比较 000001 SZ 和 AAPL", {"600519", "000001", "AAPL"}, {"SZ"}),
+            ("比较 920748 BJ 和 AAPL", {"600519", "920748", "AAPL"}, {"BJ"}),
+            ("比较 01810 HK 和 AAPL", {"600519", "HK01810", "AAPL"}, {"HK"}),
+            ("比较 600519 SS 和 AAPL", {"600519", "AAPL"}, {"SS"}),
+        ]
+
+        for message, expected_allowed, forbidden_tokens in cases:
+            with self.subTest(message=message):
+                result = resolve_stock_scope(
+                    message,
+                    {"stock_code": "600519", "stock_name": "匿名标的"},
+                )
+
+                self.assertEqual(result.stock_scope.mode, "compare")
+                self.assertEqual(result.stock_scope.allowed_stock_codes, expected_allowed)
+                for token in forbidden_tokens:
+                    self.assertNotIn(token, result.stock_scope.allowed_stock_codes)
+
+    def test_switch_recognizes_lowercase_us_ticker_with_explicit_hint(self):
+        result = resolve_stock_scope(
+            "分析tsla",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "switch")
+        self.assertEqual(result.stock_scope.expected_stock_code, "TSLA")
+        self.assertEqual(result.effective_context["stock_code"], "TSLA")
+        self.assertEqual(result.effective_context["stock_name"], "")
+
+    def test_compare_recognizes_lowercase_us_tickers(self):
+        result = resolve_stock_scope(
+            "比较 600519 和 tsla",
+            {"stock_code": "600519", "stock_name": "匿名标的"},
+        )
+
+        self.assertEqual(result.stock_scope.mode, "compare")
+        self.assertEqual(result.effective_context["stock_code"], "600519")
+        self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519", "TSLA"})
 
 
 # ============================================================
@@ -500,12 +770,38 @@ class TestOrchestratorModes(unittest.TestCase):
         self.assertEqual(orch.mode, "standard")
 
     def test_chain_agents_inherit_orchestrator_max_steps(self):
+        """Default/lowered limits cap agents; raised limits hard-override all agents."""
         orch = self._make_orchestrator("full")
-        orch.max_steps = 9
-        ctx = AgentContext(query="test", stock_code="600519")
-        chain = orch._build_agent_chain(ctx)
-        self.assertTrue(chain)
-        self.assertTrue(all(agent.max_steps == 9 for agent in chain))
+        orch.max_steps = AGENT_MAX_STEPS_DEFAULT
+        high_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
+        self.assertEqual(
+            {agent.agent_name: agent.max_steps for agent in high_limit_chain},
+            {"technical": 6, "intel": 4, "risk": 4, "decision": 3},
+        )
+
+        orch.max_steps = 5
+        low_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
+        self.assertEqual(
+            {agent.agent_name: agent.max_steps for agent in low_limit_chain},
+            {"technical": 5, "intel": 4, "risk": 4, "decision": 3},
+        )
+
+        orch.max_steps = AGENT_MAX_STEPS_DEFAULT + 2
+        raised_limit_chain = orch._build_agent_chain(AgentContext(query="test", stock_code="600519"))
+        self.assertEqual(
+            {agent.agent_name: agent.max_steps for agent in raised_limit_chain},
+            {"technical": AGENT_MAX_STEPS_DEFAULT + 2, "intel": AGENT_MAX_STEPS_DEFAULT + 2, "risk": AGENT_MAX_STEPS_DEFAULT + 2, "decision": AGENT_MAX_STEPS_DEFAULT + 2},
+        )
+
+    def test_prepare_agent_raised_limit_overrides_low_default_agent(self):
+        orch = self._make_orchestrator("full")
+        orch.max_steps = AGENT_MAX_STEPS_DEFAULT + 2
+        decision = MagicMock(agent_name="decision", max_steps=3)
+
+        prepared = orch._prepare_agent(decision)
+
+        self.assertIs(prepared, decision)
+        self.assertEqual(prepared.max_steps, AGENT_MAX_STEPS_DEFAULT + 2)
 
     def test_build_context_from_dict(self):
         orch = self._make_orchestrator()
@@ -516,6 +812,26 @@ class TestOrchestratorModes(unittest.TestCase):
         self.assertEqual(ctx.stock_code, "600519")
         self.assertEqual(ctx.stock_name, "贵州茅台")
         self.assertEqual(ctx.meta["skills_requested"], ["bull_trend"])
+
+    def test_build_context_keeps_market_phase_context_in_meta_not_data(self):
+        orch = self._make_orchestrator()
+        phase_context = {"phase": "intraday", "is_partial_bar": True}
+        pack_summary = "\n## 分析上下文包摘要\n- 数据块状态：行情 available\n"
+
+        ctx = orch._build_context(
+            "Analyze 600519",
+            context={
+                "stock_code": "600519",
+                "stock_name": "贵州茅台",
+                "market_phase_context": phase_context,
+                "analysis_context_pack_summary": pack_summary,
+            },
+        )
+
+        self.assertEqual(ctx.meta["market_phase_context"], phase_context)
+        self.assertEqual(ctx.meta["analysis_context_pack_summary"], pack_summary)
+        self.assertNotIn("market_phase_context", ctx.data)
+        self.assertNotIn("analysis_context_pack_summary", ctx.data)
 
     def test_build_context_extracts_code_from_query(self):
         orch = self._make_orchestrator()
@@ -552,6 +868,24 @@ class TestOrchestratorExecution(unittest.TestCase):
         result.meta["models_used"] = ["test/model"]
         return result
 
+    def test_prepare_agent_uses_default_constant_as_raise_threshold(self):
+        orch = self._make_orchestrator()
+        agent = MagicMock(agent_name="technical", max_steps=6)
+
+        prepared = orch._prepare_agent(agent)
+        self.assertIs(prepared, agent)
+        self.assertEqual(agent.max_steps, 6)
+
+        orch.max_steps = 12
+        agent.max_steps = 6
+        orch._prepare_agent(agent)
+        self.assertEqual(agent.max_steps, 12)
+
+        orch.max_steps = 5
+        agent.max_steps = 6
+        orch._prepare_agent(agent)
+        self.assertEqual(agent.max_steps, 5)
+
     def test_execute_pipeline_stops_on_critical_failure(self):
         orch = self._make_orchestrator()
         technical = MagicMock(agent_name="technical")
@@ -579,6 +913,133 @@ class TestOrchestratorExecution(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertIn("Analysis Summary", result.content)
+
+    def test_execute_pipeline_degrades_on_skill_agent_failure_and_continues_to_decision(self):
+        orch = self._make_orchestrator()
+        orch.mode = "specialist"
+        ctx = AgentContext(query="test", stock_code="600519")
+        ctx.add_opinion(AgentOpinion(agent_name="technical", signal="buy", confidence=0.8, reasoning="Strong trend"))
+
+        technical = MagicMock(agent_name="technical")
+        technical.run.return_value = self._stage_result("technical")
+        intel = MagicMock(agent_name="intel")
+        intel.run.return_value = self._stage_result("intel")
+        risk = MagicMock(agent_name="risk")
+        risk.run.return_value = self._stage_result("risk")
+        skill = MagicMock(agent_name="strategy_bull_trend")
+        skill.run.return_value = self._stage_result("strategy_bull_trend", StageStatus.FAILED, error="skill boom")
+        decision = MagicMock(agent_name="decision")
+        decision.run.return_value = self._stage_result("decision")
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, intel, risk, decision]):
+            with patch.object(orch, "_build_specialist_agents", return_value=[skill]):
+                result = orch._execute_pipeline(ctx, parse_dashboard=False)
+
+        self.assertTrue(result.success)
+        self.assertIn("Analysis Summary", result.content)
+        skill.run.assert_called_once()
+        decision.run.assert_called_once()
+
+    def test_execute_pipeline_skips_stage_when_remaining_budget_below_minimum(self):
+        orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=20))
+        ctx = AgentContext(query="test", stock_code="600519", stock_name="贵州茅台")
+
+        technical = MagicMock(agent_name="technical")
+
+        def _run_technical(run_ctx, progress_callback=None):
+            run_ctx.add_opinion(AgentOpinion(
+                agent_name="technical",
+                signal="buy",
+                confidence=0.8,
+                reasoning="技术面结构未出现明显拐点，趋势偏强。",
+                raw_data={"ma_alignment": "bullish", "trend_score": 82, "volume_status": "normal"},
+            ))
+            return self._stage_result("technical")
+
+        technical.run.side_effect = _run_technical
+        intel = MagicMock(agent_name="intel", tool_names=["news_search"])
+        intel.run.side_effect = AssertionError("intel should be skipped due to budget guard")
+        times = iter([0.0, 0.2, 0.3, 14.6, 14.7])
+
+        def _next_time():
+            return next(times, 100.0)
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, intel]):
+            with patch("src.agent.orchestrator.time.time", side_effect=_next_time):
+                result = orch._execute_pipeline(ctx)
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.dashboard)
+        self.assertIsNotNone(result.content)
+        self.assertIn("insufficient budget", (result.error or "").lower())
+        self.assertIn("[降级结果]", result.dashboard["analysis_summary"])
+        technical.run.assert_called_once()
+        intel.run.assert_not_called()
+
+    def test_execute_pipeline_skips_toolless_decision_with_low_remaining_budget(self):
+        orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=20))
+        ctx = AgentContext(query="test", stock_code="600519", stock_name="贵州茅台")
+
+        technical = MagicMock(agent_name="technical")
+
+        def _run_technical(run_ctx, progress_callback=None):
+            run_ctx.add_opinion(AgentOpinion(
+                agent_name="technical",
+                signal="buy",
+                confidence=0.8,
+                reasoning="技术面结构未出现明显拐点，趋势偏强。",
+                raw_data={"ma_alignment": "bullish", "trend_score": 82, "volume_status": "normal"},
+            ))
+            return self._stage_result("technical")
+
+        technical.run.side_effect = _run_technical
+        decision = MagicMock(agent_name="decision", tool_names=[])
+
+        def _run_decision(run_ctx, progress_callback=None):
+            run_ctx.add_opinion(AgentOpinion(
+                agent_name="decision",
+                signal="buy",
+                confidence=0.87,
+                reasoning="综合技术与情绪判断，倾向于买入。",
+            ))
+            return self._stage_result("decision")
+
+        decision.run.side_effect = _run_decision
+        times = iter([0.0, 0.2, 0.3, 14.6, 14.7])
+
+        def _next_time():
+            return next(times, 100.0)
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical, decision]):
+            with patch("src.agent.orchestrator.time.time", side_effect=_next_time):
+                result = orch._execute_pipeline(ctx)
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.content)
+        self.assertIn("insufficient budget", (result.error or "").lower())
+        self.assertEqual(result.total_steps, 1)
+        technical.run.assert_called_once()
+        decision.run.assert_not_called()
+
+    def test_execute_pipeline_first_stage_still_runs_when_timeout_short(self):
+        orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=10))
+        ctx = AgentContext(query="test", stock_code="600519", stock_name="贵州茅台")
+
+        technical = MagicMock(agent_name="technical")
+        technical.run.side_effect = lambda run_ctx, progress_callback=None: self._stage_result("technical")
+        times = iter([0.0, 0.2, 0.3, 0.4, 0.5])
+
+        def _next_time():
+            return next(times, 1.0)
+
+        with patch.object(orch, "_build_agent_chain", return_value=[technical]):
+            with patch("src.agent.orchestrator.time.time", side_effect=_next_time):
+                result = orch._execute_pipeline(ctx)
+
+        self.assertIsNotNone(result.error)
+        self.assertEqual(result.total_steps, 1)
+        technical.run.assert_called_once()
+        self.assertNotIn("insufficient budget", (result.error or "").lower())
 
     def test_execute_pipeline_times_out_after_stage(self):
         orch = self._make_orchestrator(config=SimpleNamespace(agent_orchestrator_timeout_s=1))
@@ -703,12 +1164,106 @@ class TestOrchestratorExecution(unittest.TestCase):
             return OrchestratorResult(success=True, content="assistant reply")
 
         with patch.object(orch, "_execute_pipeline", side_effect=fake_execute):
-            with patch("src.agent.conversation.conversation_manager.get_or_create") as get_or_create:
-                get_or_create.return_value.get_history.return_value = history
-                with patch("src.agent.conversation.conversation_manager.add_message"):
-                    orch.chat("hello", "session-1")
+            with patch("src.agent.orchestrator.build_visible_chat_history", return_value=history):
+                with patch("src.agent.conversation.conversation_manager.get_or_create"):
+                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                        orch.chat("hello", "session-1")
 
         self.assertEqual(captured["history"], history)
+
+    def test_chat_uses_compressed_history_builder(self):
+        from src.agent.orchestrator import OrchestratorResult
+
+        orch = self._make_orchestrator()
+
+        with patch.object(orch, "_execute_pipeline", return_value=OrchestratorResult(success=True, content="ok")):
+            with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]) as build_history:
+                with patch("src.agent.conversation.conversation_manager.get_or_create"):
+                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                        orch.chat("hello", "session-1")
+
+        build_history.assert_called_once()
+        self.assertEqual(build_history.call_args.args[0], "session-1")
+        self.assertIs(build_history.call_args.args[1], orch.llm_adapter)
+
+    def test_chat_resolves_scope_and_stores_it_for_multi_agent_chain(self):
+        from src.agent.orchestrator import OrchestratorResult
+
+        orch = self._make_orchestrator()
+        captured = {}
+
+        def fake_execute(ctx, parse_dashboard=False, progress_callback=None):
+            captured["ctx"] = ctx
+            return OrchestratorResult(success=True, content="assistant reply")
+
+        with patch.object(orch, "_execute_pipeline", side_effect=fake_execute):
+            with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]):
+                with patch("src.agent.conversation.conversation_manager.get_or_create"):
+                    with patch("src.agent.conversation.conversation_manager.add_message"):
+                        orch.chat(
+                            "换成 AAPL 看看",
+                            "session-1",
+                            context={
+                                "stock_code": "600519",
+                                "stock_name": "匿名标的",
+                                "previous_analysis_summary": {"summary": "old"},
+                            },
+                        )
+
+        ctx = captured["ctx"]
+        self.assertEqual(ctx.stock_code, "AAPL")
+        self.assertEqual(ctx.stock_name, "")
+        self.assertNotIn("previous_analysis_summary", ctx.meta)
+        self.assertEqual(ctx.meta["stock_scope"].mode, "switch")
+        self.assertEqual(ctx.meta["stock_scope"].expected_stock_code, "AAPL")
+
+    def test_chat_does_not_read_or_write_provider_trace(self):
+        from src.agent.orchestrator import OrchestratorResult
+
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+        session_id = "multi-agent-trace-boundary"
+        user_id = db.save_conversation_message(session_id, "user", "previous question")
+        assistant_id = db.save_conversation_message(session_id, "assistant", "previous answer")
+        db.save_agent_provider_turn(
+            session_id=session_id,
+            run_id="run-existing",
+            provider="deepseek",
+            model="deepseek/deepseek-chat",
+            anchor_user_message_id=user_id,
+            anchor_assistant_message_id=assistant_id,
+            messages=[
+                {
+                    "role": "assistant",
+                    "reasoning_content": "reasoning",
+                    "tool_calls": [{"id": "call_1", "name": "echo", "arguments": {}}],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool-result"},
+            ],
+            contains_reasoning=True,
+            contains_tool_calls=True,
+            contains_thinking_blocks=False,
+            must_roundtrip=True,
+            estimated_tokens=10,
+        )
+
+        orch = self._make_orchestrator()
+        try:
+            with patch.object(orch, "_execute_pipeline", return_value=OrchestratorResult(success=True, content="ok")):
+                with patch("src.agent.orchestrator.build_visible_chat_history", return_value=[]) as build_history:
+                    with patch.object(db, "get_agent_provider_turns", wraps=db.get_agent_provider_turns) as get_turns:
+                        result = orch.chat("hello", session_id)
+
+            self.assertTrue(result.success)
+            build_history.assert_called_once()
+            get_turns.assert_not_called()
+            rows = db.get_agent_provider_turns(session_id)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["run_id"], "run-existing")
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
 
     def test_chat_persists_user_and_assistant_messages(self):
         from src.agent.orchestrator import OrchestratorResult
@@ -848,6 +1403,17 @@ class TestDecisionAgentChatMode(unittest.TestCase):
         self.assertIsNone(ctx.get_data("final_dashboard"))
         self.assertEqual(opinion.signal, "buy")
 
+    def test_decision_agent_prompt_requires_phase_decision(self):
+        from src.agent.agents.decision_agent import DecisionAgent
+
+        agent = DecisionAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        prompt = agent.system_prompt(AgentContext(query="分析 600519", stock_code="600519"))
+
+        self.assertIn("phase_decision", prompt)
+        self.assertIn("watch_conditions", prompt)
+        self.assertIn("data_limitations", prompt)
+        self.assertIn("confidence_level", prompt)
+
 
 class TestTechnicalAgentSkillPolicy(unittest.TestCase):
     """TechnicalAgent should only receive the legacy trend baseline for implicit/default runs."""
@@ -913,6 +1479,389 @@ class TestBaseAgentMessageAssembly(unittest.TestCase):
         self.assertEqual(messages[1], {"role": "user", "content": "old question"})
         self.assertEqual(messages[2], {"role": "assistant", "content": "old answer"})
         self.assertEqual(messages[-1], {"role": "user", "content": "current turn"})
+
+    def test_build_messages_injects_market_phase_before_cached_data(self):
+        agent = self._make_agent()
+        ctx = AgentContext(query="hello", stock_code="600519")
+        ctx.meta["market_phase_context"] = {
+            "market": "cn",
+            "phase": "intraday",
+            "market_local_time": "2026-03-27T10:00:00+08:00",
+            "effective_daily_bar_date": "2026-03-26",
+            "is_partial_bar": True,
+            "minutes_to_close": 300,
+        }
+        ctx.meta["analysis_context_pack_summary"] = "\n## 分析上下文包摘要\n- 数据块状态：行情 available\n"
+        ctx.set_data("realtime_quote", {"price": 1880.0})
+
+        messages = agent._build_messages(ctx)
+
+        phase_indexes = [
+            idx for idx, message in enumerate(messages)
+            if "市场阶段上下文" in message.get("content", "")
+        ]
+        cached_indexes = [
+            idx for idx, message in enumerate(messages)
+            if "[Pre-fetched: realtime_quote]" in message.get("content", "")
+        ]
+        pack_indexes = [
+            idx for idx, message in enumerate(messages)
+            if "分析上下文包摘要" in message.get("content", "")
+        ]
+        self.assertEqual(len(phase_indexes), 1)
+        self.assertEqual(len(pack_indexes), 1)
+        self.assertEqual(len(cached_indexes), 1)
+        self.assertLess(phase_indexes[0], pack_indexes[0])
+        self.assertLess(pack_indexes[0], cached_indexes[0])
+        phase_message = messages[phase_indexes[0]]
+        self.assertEqual(phase_message["role"], "user")
+        self.assertIn("盘中", phase_message["content"])
+        self.assertIn("不得当作完整日线复盘", phase_message["content"])
+        self.assertNotIn("market_phase_context", phase_message["content"])
+        self.assertNotIn("is_partial_bar", phase_message["content"])
+        pack_message = messages[pack_indexes[0]]
+        self.assertEqual(pack_message["role"], "user")
+        self.assertNotIn("analysis_context_pack_summary", pack_message["content"])
+
+    def test_run_passes_stock_scope_from_context_meta_to_shared_runner(self):
+        from src.agent.runner import RunLoopResult
+
+        agent = self._make_agent()
+        ctx = AgentContext(query="hello", stock_code="600519")
+        ctx.meta["stock_scope"] = StockScope(
+            expected_stock_code="600519",
+            allowed_stock_codes={"600519"},
+        )
+
+        with patch(
+            "src.agent.agents.base_agent.run_agent_loop",
+            return_value=RunLoopResult(success=True, content="ok"),
+        ) as run_loop:
+            result = agent.run(ctx)
+
+        self.assertEqual(result.status, StageStatus.COMPLETED)
+        self.assertIs(run_loop.call_args.kwargs["stock_scope"], ctx.meta["stock_scope"])
+
+
+# ============================================================
+# EventMonitor serialization
+# ============================================================
+
+class TestEventMonitor(unittest.TestCase):
+    """Test EventMonitor serialize/deserialize round-trip."""
+
+    def test_round_trip(self):
+        from src.agent.events import EventMonitor, PriceAlert, PriceChangeAlert, VolumeAlert
+        monitor = EventMonitor()
+        monitor.add_alert(PriceAlert(stock_code="600519", direction="above", price=1800.0))
+        monitor.add_alert(PriceChangeAlert(stock_code="300750", direction="down", change_pct=3.5))
+        monitor.add_alert(VolumeAlert(stock_code="000858", multiplier=3.0))
+
+        data = monitor.to_dict_list()
+        self.assertEqual(len(data), 3)
+        self.assertEqual(data[1]["alert_type"], "price_change_percent")
+        self.assertEqual(data[1]["change_pct"], 3.5)
+
+        restored = EventMonitor.from_dict_list(data)
+        self.assertEqual(len(restored.rules), 3)
+        self.assertEqual(restored.rules[0].stock_code, "600519")
+        self.assertEqual(restored.rules[1].stock_code, "300750")
+        self.assertEqual(restored.rules[2].stock_code, "000858")
+
+    def test_serialization_contract_keeps_supported_rule_keys_stable(self):
+        from src.agent.events import (
+            AlertStatus,
+            EventMonitor,
+            PriceAlert,
+            PriceChangeAlert,
+            VolumeAlert,
+        )
+
+        monitor = EventMonitor()
+        monitor.add_alert(PriceAlert(stock_code="600519", direction="above", price=1800.0))
+        monitor.add_alert(PriceChangeAlert(stock_code="300750", direction="down", change_pct=3.5))
+        monitor.add_alert(VolumeAlert(stock_code="000858", multiplier=3.0))
+        monitor.rules[1].status = AlertStatus.TRIGGERED
+        monitor.rules[2].status = AlertStatus.EXPIRED
+
+        data = monitor.to_dict_list()
+
+        common_keys = {
+            "stock_code",
+            "alert_type",
+            "description",
+            "status",
+            "created_at",
+            "ttl_hours",
+        }
+        self.assertEqual(set(data[0]), common_keys | {"direction", "price"})
+        self.assertEqual(set(data[1]), common_keys | {"direction", "change_pct"})
+        self.assertEqual(set(data[2]), common_keys | {"multiplier"})
+        known_status_values = {status.value for status in AlertStatus}
+        for entry in data:
+            self.assertIn(entry["status"], known_status_values)
+
+        restored = EventMonitor.from_dict_list(data)
+
+        self.assertEqual([rule.status for rule in restored.rules], [
+            AlertStatus.ACTIVE,
+            AlertStatus.TRIGGERED,
+            AlertStatus.EXPIRED,
+        ])
+
+    def test_remove_expired(self):
+        import time
+        from src.agent.events import EventMonitor, PriceAlert
+        monitor = EventMonitor()
+        alert = PriceAlert(stock_code="600519", direction="above", price=1800.0, ttl_hours=0.0)
+        alert.created_at = time.time() - 3600  # 1 hour ago
+        monitor.rules.append(alert)
+        removed = monitor.remove_expired()
+        self.assertEqual(removed, 1)
+        self.assertEqual(len(monitor.rules), 0)
+
+    def test_add_alert_rejects_unsupported_rule_type(self):
+        from src.agent.events import EventMonitor, SentimentAlert
+
+        monitor = EventMonitor()
+
+        with self.assertRaises(ValueError):
+            monitor.add_alert(SentimentAlert(stock_code="600519"))
+
+    def test_from_dict_list_skips_unsupported_placeholder_rule_type(self):
+        from src.agent.events import EventMonitor
+
+        data = [
+            {"stock_code": "600519", "alert_type": "sentiment_shift"},
+            {
+                "stock_code": "000858",
+                "alert_type": "volume_spike",
+                "multiplier": 2.5,
+            },
+        ]
+
+        monitor = EventMonitor.from_dict_list(data)
+
+        self.assertEqual(len(monitor.rules), 1)
+        self.assertEqual(monitor.rules[0].stock_code, "000858")
+
+    def test_from_dict_list_skips_price_change_without_change_pct(self):
+        from src.agent.events import EventMonitor
+
+        data = [
+            {
+                "stock_code": "300750",
+                "alert_type": "price_change_percent",
+                "direction": "up",
+            }
+        ]
+
+        monitor = EventMonitor.from_dict_list(data)
+
+        self.assertEqual(monitor.rules, [])
+
+
+class TestEventMonitorAsync(unittest.IsolatedAsyncioTestCase):
+    """Test async EventMonitor checks offload blocking fetches."""
+
+    async def test_check_price_uses_to_thread_and_triggers(self):
+        from src.agent.events import EventMonitor, PriceAlert
+
+        monitor = EventMonitor()
+        rule = PriceAlert(stock_code="600519", direction="above", price=1800.0)
+        quote = SimpleNamespace(price=1810.0)
+
+        with patch("src.agent.events.asyncio.to_thread", new=AsyncMock(return_value=quote)) as to_thread:
+            triggered = await monitor._check_price(rule)
+
+        self.assertIsNotNone(triggered)
+        self.assertEqual(triggered.rule.stock_code, "600519")
+        to_thread.assert_awaited_once()
+
+    async def test_check_price_change_uses_to_thread_and_triggers(self):
+        from src.agent.events import EventMonitor, PriceChangeAlert
+
+        monitor = EventMonitor()
+        rule = PriceChangeAlert(stock_code="300750", direction="down", change_pct=3.0)
+        quote = SimpleNamespace(change_pct=-3.25)
+
+        with patch("src.agent.events.asyncio.to_thread", new=AsyncMock(return_value=quote)) as to_thread:
+            triggered = await monitor._check_price_change(rule)
+
+        self.assertIsNotNone(triggered)
+        self.assertEqual(triggered.rule.stock_code, "300750")
+        self.assertEqual(triggered.current_value, -3.25)
+        self.assertIn("current = -3.25%", triggered.message)
+        to_thread.assert_awaited_once()
+
+    async def test_check_price_change_accepts_dict_payload_alias(self):
+        from src.agent.events import EventMonitor, PriceChangeAlert
+
+        monitor = EventMonitor()
+        rule = PriceChangeAlert(stock_code="AAPL", direction="up", change_pct=2.0)
+
+        with patch("src.agent.events.asyncio.to_thread", new=AsyncMock(return_value={"pct_chg": "2.35%"})):
+            triggered = await monitor._check_price_change(rule)
+
+        self.assertIsNotNone(triggered)
+        self.assertEqual(triggered.current_value, 2.35)
+
+    async def test_realtime_rules_create_fetcher_manager_per_quote_check(self):
+        from src.agent.events import EventMonitor, PriceAlert, PriceChangeAlert
+
+        monitor = EventMonitor()
+        monitor.add_alert(PriceAlert(stock_code="600519", direction="above", price=1800.0))
+        monitor.add_alert(PriceChangeAlert(stock_code="600519", direction="up", change_pct=3.0))
+        managers = [MagicMock(), MagicMock()]
+        for manager in managers:
+            manager.get_realtime_quote.return_value = SimpleNamespace(price=1810.0, change_pct=3.25)
+
+        async def _run_inline(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("data_provider.DataFetcherManager", side_effect=managers) as manager_factory, patch(
+            "src.agent.events.asyncio.to_thread", new=_run_inline
+        ):
+            triggered = await monitor.check_all()
+
+        self.assertEqual(manager_factory.call_count, 2)
+        for manager in managers:
+            manager.get_realtime_quote.assert_called_once_with("600519")
+        self.assertEqual(len(triggered), 2)
+
+    async def test_check_volume_safe_when_fetch_returns_none(self):
+        """_check_volume must not crash when get_daily_data returns None."""
+        from src.agent.events import EventMonitor, VolumeAlert
+
+        monitor = EventMonitor()
+        rule = VolumeAlert(stock_code="600519", multiplier=2.0)
+
+        with patch("src.agent.events.asyncio.to_thread", new=AsyncMock(return_value=None)):
+            result = await monitor._check_volume(rule)
+
+        self.assertIsNone(result)
+
+    async def test_check_all_async_callback(self):
+        """on_trigger callbacks should be properly awaited if coroutine."""
+        from src.agent.events import EventMonitor, PriceAlert
+
+        monitor = EventMonitor()
+        rule = PriceAlert(stock_code="600519", direction="above", price=1800.0)
+        monitor.add_alert(rule)
+
+        callback_values = []
+        async_cb = AsyncMock(side_effect=lambda alert: callback_values.append(alert.rule.stock_code))
+        monitor.on_trigger(async_cb)
+
+        quote = SimpleNamespace(price=1810.0)
+        with patch("src.agent.events.asyncio.to_thread", new=AsyncMock(return_value=quote)):
+            triggered = await monitor.check_all()
+
+        self.assertEqual(len(triggered), 1)
+        async_cb.assert_awaited_once()
+
+
+class TestEventMonitorConfigIntegration(unittest.TestCase):
+    """Test config-driven EventMonitor construction."""
+
+    def test_build_event_monitor_from_config(self):
+        from src.agent.events import build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json='[{"stock_code":"600519","alert_type":"price_cross","direction":"above","price":1800}]',
+        )
+
+        with patch("src.notification.NotificationService", return_value=MagicMock()):
+            monitor = build_event_monitor_from_config(config=config)
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(len(monitor.rules), 1)
+        self.assertEqual(monitor.rules[0].stock_code, "600519")
+
+    def test_configured_event_monitor_notification_uses_alert_route(self):
+        from src.agent.events import TriggeredAlert, build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json='[{"stock_code":"600519","alert_type":"price_cross","direction":"above","price":1800}]',
+        )
+        notifier = MagicMock()
+        notifier.send.return_value = True
+
+        monitor = build_event_monitor_from_config(config=config, notifier=notifier)
+
+        self.assertIsNotNone(monitor)
+        monitor._callbacks[0](TriggeredAlert(rule=monitor.rules[0], message="hit"))
+        notifier.send.assert_called_once()
+        self.assertIn("hit", notifier.send.call_args.args[0])
+        self.assertEqual(notifier.send.call_args.kwargs["route_type"], "alert")
+
+    def test_build_event_monitor_from_config_accepts_price_change_percent(self):
+        from src.agent.events import PriceChangeAlert, build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json=(
+                '[{"stock_code":"300750","alert_type":"price_change_percent",'
+                '"direction":"down","change_pct":3.5}]'
+            ),
+        )
+
+        with patch("src.notification.NotificationService", return_value=MagicMock()):
+            monitor = build_event_monitor_from_config(config=config)
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(len(monitor.rules), 1)
+        self.assertIsInstance(monitor.rules[0], PriceChangeAlert)
+        self.assertEqual(monitor.rules[0].change_pct, 3.5)
+
+    def test_build_event_monitor_returns_none_on_invalid_json(self):
+        from src.agent.events import build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json='[invalid',
+        )
+
+        monitor = build_event_monitor_from_config(config=config)
+        self.assertIsNone(monitor)
+
+    def test_build_event_monitor_skips_invalid_rule_entries(self):
+        from src.agent.events import build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json=(
+                '[{"stock_code":"600519","alert_type":"price_cross","direction":"above","price":1800},'
+                '{"stock_code":"000858","alert_type":"price_cross","status":"bad","direction":"above","price":120}]'
+            ),
+        )
+
+        with patch("src.notification.NotificationService", return_value=MagicMock()):
+            monitor = build_event_monitor_from_config(config=config)
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(len(monitor.rules), 1)
+        self.assertEqual(monitor.rules[0].stock_code, "600519")
+
+    def test_build_event_monitor_skips_unsupported_rule_types(self):
+        from src.agent.events import build_event_monitor_from_config
+
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json=(
+                '[{"stock_code":"600519","alert_type":"sentiment_shift"},'
+                '{"stock_code":"000858","alert_type":"price_cross","direction":"above","price":120}]'
+            ),
+        )
+
+        with patch("src.notification.NotificationService", return_value=MagicMock()):
+            monitor = build_event_monitor_from_config(config=config)
+
+        self.assertIsNotNone(monitor)
+        self.assertEqual(len(monitor.rules), 1)
+        self.assertEqual(monitor.rules[0].stock_code, "000858")
 
 
 # ============================================================
@@ -1002,6 +1951,23 @@ class TestBaseAgentMemoryIntegration(unittest.TestCase):
 
         self.assertIn("Memory: recent analysis history", injected)
         self.assertIn("signal=buy", injected)
+
+    def test_market_phase_meta_is_not_injected_as_prefetched_data(self):
+        memory = MagicMock(enabled=False)
+        agent = self._make_agent(memory)
+        ctx = AgentContext(query="test", stock_code="600519")
+        ctx.meta["market_phase_context"] = {"phase": "intraday"}
+        ctx.meta["analysis_context_pack_summary"] = "\n## 分析上下文包摘要\n- 数据块状态：行情 available\n"
+        ctx.set_data("realtime_quote", {"price": 1880.0})
+
+        injected = agent._inject_cached_data(ctx)
+
+        self.assertIn("[Pre-fetched: realtime_quote]", injected)
+        self.assertNotIn("market_phase_context", injected)
+        self.assertNotIn("[Pre-fetched: market_phase_context]", injected)
+        self.assertNotIn("analysis_context_pack_summary", injected)
+        self.assertNotIn("[Pre-fetched: analysis_context_pack_summary]", injected)
+        self.assertNotIn("分析上下文包摘要", injected)
 
     def test_memory_calibration_updates_confidence(self):
         memory = MagicMock(enabled=True)
@@ -1175,6 +2141,240 @@ class TestRiskOverride(unittest.TestCase):
         orch._apply_risk_override(ctx)
 
         self.assertEqual(dashboard["decision_type"], "buy")
+
+
+# ============================================================
+# ResearchCommand timeout guard
+# ============================================================
+
+class TestResearchCommandTimeout(unittest.TestCase):
+    """Verify that ResearchCommand respects the configured timeout."""
+
+    def test_research_timeout_returns_timeout_response(self):
+        """Timed-out research results should surface the timeout response text."""
+        from bot.commands.research import ResearchCommand
+        from bot.models import BotMessage
+
+        cmd = ResearchCommand()
+
+        msg = MagicMock(spec=BotMessage)
+        msg.platform = "test"
+        msg.user_id = "u1"
+
+        config = SimpleNamespace(
+            agent_deep_research_budget=30000,
+            agent_deep_research_timeout=0.01,  # 10ms — will trigger timeout
+            litellm_model="test-model",
+            agent_mode=True,
+        )
+
+        with patch("bot.commands.research.get_config", return_value=config), \
+             patch("src.agent.factory.get_tool_registry", return_value=MagicMock()), \
+             patch("src.agent.llm_adapter.LLMToolAdapter", return_value=MagicMock()), \
+             patch("src.agent.research.ResearchAgent.research", return_value=SimpleNamespace(
+                 success=False,
+                 report="",
+                 sub_questions=["q"],
+                 findings_count=1,
+                 total_tokens=100,
+                 duration_s=0.01,
+                 error="Deep research timed out after 0.01s",
+                 timed_out=True,
+             )):
+            response = cmd.execute(msg, ["600519"])
+
+        self.assertIn("超时", response.text)
+
+    def test_research_recognizes_five_letter_us_ticker(self):
+        from bot.commands.research import ResearchCommand
+        from bot.models import BotMessage
+
+        cmd = ResearchCommand()
+        msg = MagicMock(spec=BotMessage)
+        msg.platform = "test"
+        msg.user_id = "u1"
+
+        result = SimpleNamespace(
+            success=True,
+            report="ok",
+            sub_questions=["q"],
+            findings_count=1,
+            total_tokens=100,
+            duration_s=1.0,
+            error=None,
+            timed_out=False,
+        )
+        captured = {}
+
+        def _capture_research(query, context=None, timeout_seconds=None):
+            captured["query"] = query
+            captured["context"] = context
+            captured["timeout_seconds"] = timeout_seconds
+            return result
+
+        config = SimpleNamespace(
+            agent_deep_research_budget=30000,
+            agent_deep_research_timeout=1,
+            litellm_model="test-model",
+            agent_mode=True,
+        )
+
+        with patch("bot.commands.research.get_config", return_value=config), \
+             patch("src.agent.factory.get_tool_registry", return_value=MagicMock()), \
+             patch("src.agent.llm_adapter.LLMToolAdapter", return_value=MagicMock()), \
+             patch("src.agent.research.ResearchAgent.research", side_effect=_capture_research):
+            response = cmd.execute(msg, ["googl", "风险"])
+
+        self.assertIn("Deep Research Report", response.text)
+        self.assertEqual(captured["context"], {"stock_code": "GOOGL", "stock_name": ""})
+        self.assertEqual(captured["timeout_seconds"], 1)
+        self.assertTrue(captured["query"].startswith("[Stock: GOOGL]"))
+
+
+# ============================================================
+# ResearchAgent filtered registry & API endpoint
+# ============================================================
+
+class TestResearchAgentFilteredRegistry(unittest.TestCase):
+    """Test that ResearchAgent._filtered_registry delegates to BaseAgent's implementation."""
+
+    def test_filtered_registry_delegates_to_base(self):
+        from src.agent.research import ResearchAgent
+        from src.agent.tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        fake_tool = MagicMock()
+        fake_tool.name = "search_stock_news"
+        registry.register(fake_tool)
+
+        llm_adapter = MagicMock()
+        agent = ResearchAgent(tool_registry=registry, llm_adapter=llm_adapter)
+
+        filtered = agent._filtered_registry()
+        self.assertIsInstance(filtered, ToolRegistry)
+        self.assertIsNotNone(filtered.get("search_stock_news"))
+
+    def test_decompose_query_uses_shared_adapter(self):
+        from src.agent.research import ResearchAgent
+
+        llm_adapter = MagicMock()
+        llm_adapter.call_text.return_value = SimpleNamespace(
+            provider="gemini",
+            content='{"questions":["Q1","Q2"]}',
+            usage={"total_tokens": 42},
+        )
+        agent = ResearchAgent(tool_registry=MagicMock(), llm_adapter=llm_adapter)
+
+        result = agent._decompose_query("分析 600519", {"stock_code": "600519"})
+
+        self.assertEqual(result["questions"], ["Q1", "Q2"])
+        llm_adapter.call_text.assert_called_once()
+
+    def test_synthesise_report_uses_shared_adapter(self):
+        from src.agent.research import ResearchAgent
+
+        llm_adapter = MagicMock()
+        llm_adapter.call_text.return_value = SimpleNamespace(
+            provider="gemini",
+            content="Final research report",
+            usage={"total_tokens": 88},
+        )
+        agent = ResearchAgent(tool_registry=MagicMock(), llm_adapter=llm_adapter)
+
+        result = agent._synthesise_report(
+            "分析 600519",
+            [{"question": "Q1", "content": "A1"}],
+            {"stock_code": "600519"},
+        )
+
+        self.assertEqual(result["content"], "Final research report")
+        llm_adapter.call_text.assert_called_once()
+
+    def test_research_marks_synthesis_fallback_as_failure(self):
+        from src.agent.research import ResearchAgent
+
+        agent = ResearchAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        with patch.object(agent, "_decompose_query", return_value={"questions": ["Q1"], "tokens": 3}), \
+             patch.object(agent, "_research_sub_question", return_value={"summary": "done", "tokens": 7}), \
+             patch.object(agent, "_synthesise_report", return_value={"content": "fallback", "tokens": 5, "error": "boom"}):
+            result = agent.research("分析 600519")
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "boom")
+
+    def test_research_sub_question_marks_budget_guard_as_timeout(self):
+        from src.agent.research import ResearchAgent
+
+        agent = ResearchAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+        with patch("src.agent.research.run_agent_loop", return_value=SimpleNamespace(
+            success=False,
+            content="",
+            total_tokens=7,
+            error="Agent step skipped due to insufficient budget: 3.0s remaining, minimum 8.0s required",
+        )):
+            result = agent._research_sub_question(
+                "Q1",
+                {},
+                0,
+                timeout_seconds=10,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["timed_out"])
+        self.assertIn("insufficient budget", (result["error"] or "").lower())
+        self.assertEqual(result["tokens"], 7)
+
+    def test_research_returns_timeout_result_when_overall_deadline_is_exceeded(self):
+        import time as _time
+        from src.agent.research import ResearchAgent
+
+        agent = ResearchAgent(tool_registry=MagicMock(), llm_adapter=MagicMock())
+
+        def _slow_sub_question(*args, **kwargs):
+            _time.sleep(0.02)
+            return {"question": "Q1", "content": "done", "tokens": 7, "success": True}
+
+        with patch.object(agent, "_decompose_query", return_value={"questions": ["Q1"], "tokens": 3}), \
+             patch.object(agent, "_research_sub_question", side_effect=_slow_sub_question):
+            result = agent.research("分析 600519", timeout_seconds=0.01)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.timed_out)
+        self.assertIn("timed out", result.error)
+
+
+class TestAgentResearchEndpoint(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_research_returns_timeout_response(self):
+        from api.v1.endpoints.agent import ResearchRequest, agent_research
+
+        config = SimpleNamespace(
+            litellm_model="gemini/test-model",
+            agent_deep_research_budget=30000,
+            agent_deep_research_timeout=1,
+            is_agent_available=lambda: True,
+        )
+
+        research_result = AsyncMock(return_value=SimpleNamespace(
+            success=False,
+            report="",
+            sub_questions=[],
+            findings_count=0,
+            total_tokens=0,
+            duration_s=1.0,
+            error="Deep research timed out after 1s",
+            timed_out=True,
+        ))
+
+        with (
+            patch("api.v1.endpoints.agent.get_config", return_value=config),
+            patch("api.v1.endpoints.agent._run_research_in_background", new=research_result),
+            patch("src.agent.factory.get_tool_registry", return_value=MagicMock()),
+            patch("src.agent.llm_adapter.LLMToolAdapter", return_value=MagicMock()),
+        ):
+            response = await agent_research(ResearchRequest(question="600519 风险"))
+
+        self.assertFalse(response.success)
+        self.assertIn("timed out", response.error)
 
 
 if __name__ == '__main__':

@@ -41,7 +41,10 @@ from src.agent.protocols import (
     normalize_decision_signal,
 )
 from src.agent.runner import parse_dashboard_json
+from src.agent.stock_scope import resolve_stock_scope
 from src.agent.tools.registry import ToolRegistry
+from src.agent.chat_context import build_visible_chat_history
+from src.config import AGENT_MAX_STEPS_DEFAULT, get_config
 from src.report_language import normalize_report_language
 
 if TYPE_CHECKING:
@@ -83,7 +86,7 @@ class AgentOrchestrator:
         llm_adapter: LLMToolAdapter,
         skill_instructions: str = "",
         technical_skill_policy: str = "",
-        max_steps: int = 10,
+        max_steps: int = AGENT_MAX_STEPS_DEFAULT,
         mode: str = "standard",
         skill_manager=None,
         config=None,
@@ -152,10 +155,73 @@ class AgentOrchestrator:
             model=model,
         )
 
+    def _build_budget_skip_result(
+        self,
+        stats: AgentRunStats,
+        all_tool_calls: List[Dict[str, Any]],
+        models_used: List[str],
+        elapsed_s: float,
+        timeout_s: int,
+        stage_name: str,
+        remaining_budget: float,
+        min_stage_budget_s: int,
+        ctx: Optional[AgentContext] = None,
+        parse_dashboard: bool = True,
+    ) -> OrchestratorResult:
+        """Build a result for budget-insufficient stage skip (non-timeout semantics)."""
+        stats.total_duration_s = round(elapsed_s, 2)
+        stats.models_used = list(dict.fromkeys(models_used))
+        dashboard = None
+        content = ""
+        if ctx is not None:
+            dashboard, content = self._resolve_final_output(ctx, parse_dashboard=parse_dashboard)
+            if parse_dashboard and dashboard is not None:
+                dashboard = self._mark_partial_dashboard(
+                    dashboard,
+                    note="多 Agent 预算不足，以下结论基于已完成阶段自动降级生成。",
+                )
+                ctx.set_data("final_dashboard", dashboard)
+                content = json.dumps(dashboard, ensure_ascii=False, indent=2)
+
+        return OrchestratorResult(
+            success=bool(content) if (not parse_dashboard or dashboard is not None) else False,
+            content=content,
+            dashboard=dashboard,
+            error=(
+                f"Pipeline skipped before stage '{stage_name}' due to insufficient budget "
+                f"({remaining_budget:.1f}s remaining, minimum {min_stage_budget_s}s required)"
+            ),
+            stats=stats,
+            total_steps=stats.total_stages,
+            total_tokens=stats.total_tokens,
+            tool_calls_log=all_tool_calls,
+            provider=stats.models_used[0] if stats.models_used else "",
+            model=", ".join(stats.models_used),
+        )
+
+
     def _prepare_agent(self, agent: Any) -> Any:
-        """Apply orchestrator-level runtime settings to a child agent."""
+        """Apply orchestrator-level runtime settings to a child agent.
+
+        When the orchestrator-level ``max_steps`` equals the default
+        (``AGENT_MAX_STEPS_DEFAULT``),
+        each agent keeps its own per-agent limit — this prevents inflating
+        a decision agent (designed for 3 steps) to 10 steps.
+
+        When the user **explicitly** raises the global limit above the
+        default, all agents adopt the global value so the user's intent to
+        allow more steps is respected.
+
+        When the user **lowers** the global limit below an agent's default,
+        the agent is capped at the global value.
+        """
         if hasattr(agent, "max_steps"):
-            agent.max_steps = self.max_steps
+            if self.max_steps > AGENT_MAX_STEPS_DEFAULT:
+                # User explicitly raised the limit — apply to all agents.
+                agent.max_steps = self.max_steps
+            else:
+                # Default or lowered — keep per-agent limit as ceiling.
+                agent.max_steps = min(agent.max_steps, self.max_steps)
         return agent
 
     def _callable_accepts_timeout_kwarg(self, func: Any) -> Optional[bool]:
@@ -247,12 +313,16 @@ class AgentOrchestrator:
         from src.agent.executor import AgentResult
         from src.agent.conversation import conversation_manager
 
-        ctx = self._build_context(message, context)
+        scope_resolution = resolve_stock_scope(message, context)
+        ctx = self._build_context(message, scope_resolution.effective_context)
         ctx.session_id = session_id
         ctx.meta["response_mode"] = "chat"
+        if scope_resolution.stock_scope is not None:
+            ctx.meta["stock_scope"] = scope_resolution.stock_scope
 
-        session = conversation_manager.get_or_create(session_id)
-        history = session.get_history()
+        conversation_manager.get_or_create(session_id)
+        config = self.config or getattr(self.llm_adapter, "_config", None) or get_config()
+        history = build_visible_chat_history(session_id, self.llm_adapter, config)
         if history:
             ctx.meta["conversation_history"] = history
 
@@ -307,10 +377,32 @@ class AgentOrchestrator:
         specialist_agents_inserted = False
         index = 0
 
+        # Minimum seconds required for a stage to do useful work.  Starting
+        # a stage with less budget virtually guarantees a timeout that wastes
+        # an LLM billing cycle.  Only enforced after at least one stage has
+        # completed so that the first stage always gets a chance to run
+        # even when the total budget is small.
+        _MIN_STAGE_BUDGET_S = 15
+
         while index < len(agents):
             agent = agents[index]
             elapsed_s = time.time() - t0
-            if timeout_s and elapsed_s >= timeout_s:
+            remaining_budget = timeout_s - elapsed_s if timeout_s else None
+            stage_min_budget_s = (
+                _MIN_STAGE_BUDGET_S
+            )
+            timeout_exhausted = (
+                timeout_s
+                and remaining_budget is not None
+                and remaining_budget <= 0
+            )
+            budget_guard_triggered = (
+                timeout_s
+                and remaining_budget is not None
+                and index > 0
+                and remaining_budget < stage_min_budget_s
+            )
+            if timeout_exhausted:
                 logger.error("[Orchestrator] pipeline timed out before stage '%s'", agent.agent_name)
                 if progress_callback:
                     progress_callback({
@@ -325,6 +417,33 @@ class AgentOrchestrator:
                     models_used,
                     elapsed_s,
                     timeout_s,
+                    ctx=ctx,
+                    parse_dashboard=parse_dashboard,
+                )
+
+            if budget_guard_triggered:
+                logger.warning(
+                    "[Orchestrator] pipeline insufficient budget before stage '%s' (%.1fs remaining, min %ds)",
+                    agent.agent_name,
+                    remaining_budget,
+                    stage_min_budget_s,
+                )
+                if progress_callback:
+                    progress_callback({
+                        "type": "pipeline_timeout",
+                        "stage": agent.agent_name,
+                        "elapsed": round(elapsed_s, 2),
+                        "timeout": timeout_s,
+                    })
+                return self._build_budget_skip_result(
+                    stats,
+                    all_tool_calls,
+                    models_used,
+                    elapsed_s,
+                    timeout_s,
+                    agent.agent_name,
+                    remaining_budget,
+                    stage_min_budget_s,
                     ctx=ctx,
                     parse_dashboard=parse_dashboard,
                 )
@@ -405,9 +524,16 @@ class AgentOrchestrator:
             if result.success and agent.agent_name == "decision":
                 self._apply_risk_override(ctx)
 
-            # Abort pipeline on critical failure (except intel/risk — degrade gracefully)
+            # Abort pipeline on critical failure.
+            # Non-critical stages that degrade gracefully:
+            #   - intel / risk (standard support stages)
+            #   - skill agents (specialist evaluation, optional)
             if result.status == StageStatus.FAILED:
-                if agent.agent_name not in ("intel", "risk"):
+                non_critical = (
+                    agent.agent_name in ("intel", "risk")
+                    or agent.agent_name in getattr(self, "_skill_agent_names", set())
+                )
+                if not non_critical:
                     logger.error("[Orchestrator] critical stage '%s' failed: %s", agent.agent_name, result.error)
                     return OrchestratorResult(
                         success=False,
@@ -586,6 +712,14 @@ class AgentOrchestrator:
             ctx.meta["skills_requested"] = requested_skills or []
             ctx.meta["strategies_requested"] = requested_skills or []
             ctx.meta["report_language"] = normalize_report_language(context.get("report_language", "zh"))
+            if context.get("market_phase_context"):
+                ctx.meta["market_phase_context"] = context["market_phase_context"]
+            daily_market_context = context.get("daily_market_context")
+            if isinstance(daily_market_context, dict) and daily_market_context:
+                ctx.meta["daily_market_context"] = dict(daily_market_context)
+            analysis_context_pack_summary = context.get("analysis_context_pack_summary")
+            if isinstance(analysis_context_pack_summary, str) and analysis_context_pack_summary:
+                ctx.meta["analysis_context_pack_summary"] = analysis_context_pack_summary
 
             # Pre-populate data fields that the caller already has
             for data_key in ("realtime_quote", "daily_history", "chip_distribution",
@@ -795,22 +929,25 @@ class AgentOrchestrator:
         else:
             sniper = dict(sniper)
 
-        sniper.setdefault(
-            "ideal_buy",
-            key_levels.get("ideal_buy_if_valuation_improves")
-            or key_levels.get("ideal_buy")
-            or key_levels.get("support")
-            or key_levels.get("immediate_support")
-            or "N/A",
+        ideal_buy = _pick_first_level(
+            sniper.get("ideal_buy"),
+            key_levels.get("ideal_buy_if_valuation_improves"),
+            key_levels.get("ideal_buy"),
+            key_levels.get("support"),
+            key_levels.get("immediate_support"),
         )
-        sniper.setdefault(
-            "secondary_buy",
-            key_levels.get("secondary_buy")
-            or key_levels.get("support")
-            or key_levels.get("immediate_support")
-            or sniper.get("ideal_buy")
-            or "N/A",
-        )
+        sniper["ideal_buy"] = ideal_buy if ideal_buy is not None else "N/A"
+
+        secondary_buy = _coerce_level_value(sniper.get("secondary_buy"))
+        if secondary_buy is None:
+            secondary_buy = _pick_first_level(
+                key_levels.get("secondary_buy"),
+                key_levels.get("support"),
+                key_levels.get("immediate_support"),
+            )
+        if _level_values_equal(secondary_buy, sniper.get("ideal_buy")):
+            secondary_buy = None
+        sniper["secondary_buy"] = secondary_buy if secondary_buy is not None else "N/A"
         sniper.setdefault(
             "stop_loss",
             key_levels.get("stop_loss")
@@ -1238,6 +1375,9 @@ class AgentOrchestrator:
 # be kept at module level to avoid re-creating it on every call.
 _COMMON_WORDS: set[str] = {
     # Pronouns / articles / prepositions / conjunctions
+    "AM", "AS", "AT", "BE", "BY", "DO", "GO", "HE", "IF", "IN",
+    "IS", "IT", "ME", "MY", "NO", "OF", "ON", "OR", "SO", "TO",
+    "UP", "US", "WE",
     "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL",
     "CAN", "HAD", "HER", "WAS", "ONE", "OUR", "OUT", "HAS",
     "HIS", "HOW", "ITS", "LET", "MAY", "NEW", "NOW", "OLD",
@@ -1256,7 +1396,10 @@ _COMMON_WORDS: set[str] = {
     "STOCK", "TRADE", "PRICE", "INDEX", "FUND",
     "HIGH", "LOW", "OPEN", "CLOSE", "STOP", "LOSS",
     "TREND", "BULL", "BEAR", "RISK", "CASH", "BOND",
-    "MACD", "VWAP", "BOLL",
+    "MACD", "VWAP", "BOLL", "KDJ",
+    "TTM", "LTM", "NTM", "FWD", "YOY", "QOQ", "YTD",
+    "EBIT", "EBITDA", "DCF", "CAGR", "FCF", "NAV", "AUM",
+    "PE", "PB",
     # Greetings / filler words that often appear in chat messages
     "HELLO", "PLEASE", "THANKS", "CHECK", "LOOK", "THINK",
     "MAYBE", "GUESS", "TELL", "SHOW", "WHAT", "WHATS",
@@ -1266,6 +1409,11 @@ _COMMON_WORDS: set[str] = {
 _LOWERCASE_TICKER_HINTS = re.compile(
     r"分析|看看|查一?下|研究|诊断|走势|趋势|股价|股票|个股",
 )
+
+
+def _is_denied_ticker_candidate(candidate: str) -> bool:
+    """Return whether a text token should not be auto-treated as a ticker."""
+    return (candidate or "").strip().upper() in _COMMON_WORDS
 
 
 def _extract_stock_code(text: str) -> str:
@@ -1280,17 +1428,16 @@ def _extract_stock_code(text: str) -> str:
     if m:
         return m.group(1).upper()
     # US ticker — require 2+ uppercase letters bounded by non-alpha chars.
-    m = re.search(r'(?<![a-zA-Z])([A-Z]{2,5}(?:\.[A-Z]{1,2})?)(?![a-zA-Z])', text)
-    if m:
-        candidate = m.group(1)
-        if candidate not in _COMMON_WORDS:
+    for match in re.finditer(r'(?<![a-zA-Z])([A-Z]{2,5}(?:\.[A-Z]{1,2})?)(?![a-zA-Z])', text):
+        candidate = match.group(1)
+        if not _is_denied_ticker_candidate(candidate):
             return candidate
 
     stripped = (text or "").strip()
     bare_match = re.fullmatch(r'([A-Za-z]{2,5}(?:\.[A-Za-z]{1,2})?)', stripped)
     if bare_match:
         candidate = bare_match.group(1).upper()
-        if candidate not in _COMMON_WORDS:
+        if not _is_denied_ticker_candidate(candidate):
             return candidate
 
     if not _LOWERCASE_TICKER_HINTS.search(stripped):
@@ -1299,7 +1446,7 @@ def _extract_stock_code(text: str) -> str:
     for match in re.finditer(r'(?<![a-zA-Z])([A-Za-z]{2,5}(?:\.[A-Za-z]{1,2})?)(?![a-zA-Z])', text):
         raw_candidate = match.group(1)
         candidate = raw_candidate.upper()
-        if candidate in _COMMON_WORDS:
+        if _is_denied_ticker_candidate(candidate):
             continue
         return candidate
     return ""
@@ -1415,8 +1562,31 @@ def _coerce_level_value(value: Any) -> Any:
         return None
     if isinstance(value, (int, float)):
         return round(float(value), 2)
-    text = str(value).strip()
-    return text or None
+    text = str(value).replace(",", "").replace("，", "").strip()
+    if not text or text.upper() == "N/A" or text in {"-", "—"}:
+        return None
+    try:
+        return round(float(text), 2)
+    except ValueError:
+        return text
+
+
+def _pick_first_level(*values: Any) -> Any:
+    for value in values:
+        normalized = _coerce_level_value(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _level_values_equal(left: Any, right: Any) -> bool:
+    left_normalized = _coerce_level_value(left)
+    right_normalized = _coerce_level_value(right)
+    return (
+        left_normalized is not None
+        and right_normalized is not None
+        and left_normalized == right_normalized
+    )
 
 
 def _first_non_empty_text(*values: Any) -> str:
