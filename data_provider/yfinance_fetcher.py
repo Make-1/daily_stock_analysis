@@ -853,6 +853,73 @@ class YfinanceFetcher(BaseFetcher):
             logger.warning(f"[Yfinance] 获取 {stock_code} 实时行情失败: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # 公司简介（仅美股）
+    # ------------------------------------------------------------------
+
+    def get_us_stock_profile(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取美股公司简介（板块 / 行业 / 业务摘要 / 官网）。
+
+        通过 yfinance 的 `Ticker.info` 拉取，命中字段：
+        - sector / industry：板块与行业分类
+        - longBusinessSummary：公司业务摘要（英文，多为 1-3 段）
+        - longName / shortName：公司全名 / 简称
+        - website / country：补充信息
+
+        Returns:
+            dict 形式的公司简介；任何步骤失败时返回 None。结构示例：
+            {
+                "code": "AAPL",
+                "name": "Apple Inc.",
+                "sector": "Technology",
+                "industry": "Consumer Electronics",
+                "summary": "Apple Inc. designs, manufactures ...",
+                "website": "https://www.apple.com",
+                "country": "United States",
+            }
+        """
+        if not self._is_us_stock(stock_code):
+            return None
+
+        symbol = stock_code.strip().upper()
+        try:
+            import yfinance as yf  # 局部导入，避免影响只用本地数据源的场景
+        except Exception as exc:  # pragma: no cover - 防御性
+            logger.debug(f"[Yfinance] yfinance 库不可用，跳过公司简介: {exc}")
+            return None
+
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.debug(f"[Yfinance] 获取 {symbol} 公司简介失败: {exc}")
+            return None
+
+        if not isinstance(info, dict) or not info:
+            return None
+
+        long_name = (info.get('longName') or info.get('shortName') or '').strip()
+        sector = (info.get('sector') or '').strip()
+        industry = (info.get('industry') or '').strip()
+        summary = (info.get('longBusinessSummary') or '').strip()
+        website = (info.get('website') or '').strip()
+        country = (info.get('country') or '').strip()
+
+        # 至少有 sector/industry/summary 任一才认为是有效简介
+        if not any([sector, industry, summary, long_name]):
+            return None
+
+        return {
+            "code": symbol,
+            "name": long_name,
+            "sector": sector,
+            "industry": industry,
+            "summary": summary,
+            "website": website,
+            "country": country,
+        }
+
 
 if __name__ == "__main__":
     # 测试代码

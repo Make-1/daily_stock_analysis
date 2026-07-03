@@ -1054,7 +1054,16 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     # below, tripping the 3.0s timeout and causing a restart loop on slower
     # machines. Importing first keeps the heavy work out of the probe window;
     # genuine import failures still surface immediately to the caller.
+    logger.info(
+        "正在加载 FastAPI 应用（含 litellm、AlphaSift、DecisionSignal 等模块，"
+        "低配主机可能需要 10~30 秒），请稍候…"
+    )
+    _import_started_at = time.time()
     from api.app import app as fastapi_app
+    logger.info(
+        "FastAPI 应用加载完成（耗时 %.1fs），即将启动 uvicorn: http://%s:%d",
+        time.time() - _import_started_at, host, port,
+    )
 
     try:
         uvicorn_config = uvicorn.Config(
@@ -1505,29 +1514,20 @@ def main() -> int:
 
 
             # === 美股 Top N 筛选定时任务（每工作日早上推送到飞书） ===
+            # 统一交给 USScreenerBackgroundScheduler 处理：它使用独立的
+            # schedule.Scheduler() 实例 + 独立守护线程，避免与本分支
+            # `run_with_schedule` 共享全局 schedule jobs 导致同一任务被
+            # 两个 run_pending 循环（CLI 主循环 + 后台调度线程）重复触发
+            # 而出现飞书推送两次的问题。
             if getattr(config, 'us_screener_enabled', False):
                 try:
-                    import schedule as _schedule
-                    from src.services.us_screener_service import USScreenerService
-
-                    us_time = getattr(config, 'us_screener_schedule_time', '11:00')
-
-                    def us_screener_task():
-                        try:
-                            logger.info("[USScreener] 定时任务触发 (time=%s)", us_time)
-                            service = USScreenerService(config=config)
-                            service.run(send_notification=not args.no_notify)
-                        except Exception as exc:
-                            logger.exception("[USScreener] 定时任务执行失败: %s", exc)
-
-                    # 周一至周五均在指定时间执行
-                    _schedule.every().monday.at(us_time).do(us_screener_task)
-                    _schedule.every().tuesday.at(us_time).do(us_screener_task)
-                    _schedule.every().wednesday.at(us_time).do(us_screener_task)
-                    _schedule.every().thursday.at(us_time).do(us_screener_task)
-                    _schedule.every().friday.at(us_time).do(us_screener_task)
-                    logger.info("已注册美股 Top%d 筛选定时任务: 每工作日 %s",
-                                getattr(config, 'us_screener_top_n', 10), us_time)
+                    from src.services.us_screener_scheduler import get_us_screener_scheduler
+                    get_us_screener_scheduler().start()
+                    logger.info(
+                        "已委托后台调度器注册美股 Top%d 筛选定时任务: 每工作日 %s",
+                        getattr(config, 'us_screener_top_n', 10),
+                        getattr(config, 'us_screener_schedule_time', '11:00'),
+                    )
                 except Exception as exc:
                     logger.error("注册美股筛选定时任务失败: %s", exc)
 

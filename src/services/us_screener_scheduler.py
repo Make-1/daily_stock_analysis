@@ -14,13 +14,17 @@
 - 失败不阻塞：调度任务异常仅记录日志
 - 不与一次性 `--schedule` CLI 模式冲突：阻塞式 `run_with_schedule` 由
   CLI 自己运行，这里只服务 Web 常驻模式
+- 使用独立的 `schedule.Scheduler()` 实例，而不是全局 `schedule` 模块单例。
+  这样可以避免与 `src.scheduler.Scheduler`（runtime scheduler / CLI 调度模式）
+  共享全局 jobs 列表，从而避免在 `python main.py --serve --schedule` 模式下
+  两个独立的 `run_pending()` 循环同时拾取并执行同一个 us screener job，
+  导致飞书推送被发送两次。
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Optional
 
 import schedule
@@ -31,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class USScreenerBackgroundScheduler:
-    """美股筛选后台调度器（单例 + 守护线程）。"""
+    """美股筛选后台调度器（单例 + 守护线程 + 独立 schedule 实例）。"""
 
     _instance: Optional["USScreenerBackgroundScheduler"] = None
     _instance_lock = threading.Lock()
@@ -43,6 +47,13 @@ class USScreenerBackgroundScheduler:
         self._current_enabled: bool = False
         self._current_time: str = ""
         self._tag = "us_screener_job"
+        # 独立的 schedule 实例：与全局 `schedule` 模块以及任何其他
+        # 使用全局 schedule 的循环（如 src.scheduler.Scheduler）完全隔离，
+        # 避免同一 job 被多个 run_pending 循环重复触发。
+        self._scheduler = schedule.Scheduler()
+        # 任务执行级互斥锁：作为额外护栏，即使外部出现意外的重复触发，
+        # 也保证同一时刻只有一个筛选任务在运行（重入直接跳过，记录日志）。
+        self._job_run_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls) -> "USScreenerBackgroundScheduler":
@@ -53,8 +64,14 @@ class USScreenerBackgroundScheduler:
         return cls._instance
 
     # ------------------------------------------------------------------ Job
-    @staticmethod
-    def _run_screener_job() -> None:
+    def _run_screener_job(self) -> None:
+        # 用 acquire(blocking=False) 防止重入：如果上一次任务尚未结束，
+        # 本次触发直接跳过，避免推送两次。
+        if not self._job_run_lock.acquire(blocking=False):
+            logger.warning(
+                "[USScreenerScheduler] 上一次任务尚未结束，跳过本次触发，避免重复推送"
+            )
+            return
         try:
             from src.services.us_screener_service import USScreenerService
 
@@ -64,18 +81,22 @@ class USScreenerBackgroundScheduler:
             logger.info("[USScreenerScheduler] 完成，返回 %d 只", len(items))
         except Exception as exc:
             logger.exception("[USScreenerScheduler] 任务执行失败: %s", exc)
+        finally:
+            self._job_run_lock.release()
 
     # ------------------------------------------------------------- Registry
     def _clear_jobs(self) -> None:
         try:
-            schedule.clear(self._tag)
+            self._scheduler.clear(self._tag)
         except Exception as exc:
             logger.warning("[USScreenerScheduler] 清理旧任务失败: %s", exc)
 
     def _register_jobs(self, hhmm: str) -> None:
         for day in ("monday", "tuesday", "wednesday", "thursday", "friday"):
             try:
-                getattr(schedule.every(), day).at(hhmm).do(self._run_screener_job).tag(self._tag)
+                getattr(self._scheduler.every(), day).at(hhmm).do(
+                    self._run_screener_job
+                ).tag(self._tag)
             except Exception as exc:
                 logger.error("[USScreenerScheduler] 注册 %s %s 失败: %s", day, hhmm, exc)
 
@@ -107,7 +128,7 @@ class USScreenerBackgroundScheduler:
         logger.info("[USScreenerScheduler] 后台调度线程启动")
         while not self._stop_event.is_set():
             try:
-                schedule.run_pending()
+                self._scheduler.run_pending()
             except Exception as exc:
                 logger.warning("[USScreenerScheduler] tick 异常: %s", exc)
             self._stop_event.wait(1.0)

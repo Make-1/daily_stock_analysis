@@ -2206,6 +2206,89 @@ class DataFetcherManager:
         logger.warning(f"[股票名称] 所有数据源都无法获取 {stock_code} 的名称")
         return ""
 
+    def get_us_stock_profile(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """
+        获取美股公司简介（板块 / 行业 / 业务摘要）。
+
+        查询优先级：
+        1. 本地中文简介映射 `US_STOCK_PROFILE_CN`（覆盖默认候选池，离线且中文）
+        2. 各 fetcher 的 `get_us_stock_profile`（当前仅 YfinanceFetcher，
+           返回 yfinance 原生英文字段）
+
+        为避免对同一只股票重复触发 yfinance 的 `Ticker.info`（单次约 0.5-2s），
+        本方法持有一个进程级内存缓存。公司简介几乎不会日内变化，缓存安全。
+
+        Args:
+            stock_code: 美股代码，如 'AAPL'。
+
+        Returns:
+            公司简介 dict（结构见 `YfinanceFetcher.get_us_stock_profile`），
+            非美股或所有数据源都失败时返回 None。中文映射命中时 `summary_source="local_cn"`,
+            英文回退时为 `summary_source="yfinance"`。
+        """
+        from .akshare_fetcher import _is_us_code
+        if not _is_us_code(stock_code):
+            return None
+
+        symbol = (stock_code or "").strip().upper()
+        if not symbol:
+            return None
+
+        # lazy-init 进程级缓存
+        cache = getattr(self, "_us_profile_cache", None)
+        if cache is None:
+            cache = {}
+            self._us_profile_cache = cache
+
+        if symbol in cache:
+            return cache[symbol]
+
+        # 1. 优先命中本地中文简介
+        try:
+            from src.data.stock_mapping import get_us_stock_profile_cn
+            cn_profile = get_us_stock_profile_cn(symbol)
+        except Exception:  # pragma: no cover - 防御性
+            cn_profile = None
+
+        if cn_profile:
+            sector_cn, industry_cn, summary_cn = cn_profile
+            # 中文来源不需要额外网络字段（website 等），必要时再由英文 fallback 补
+            profile = {
+                "code": symbol,
+                "name": "",           # 中文短名由 STOCK_NAME_MAP / get_stock_name 侧解决
+                "sector": sector_cn,
+                "industry": industry_cn,
+                "summary": summary_cn,
+                "website": "",
+                "country": "",
+                "summary_source": "local_cn",
+            }
+            cache[symbol] = profile
+            return profile
+
+        # 2. 各 fetcher fallback（英文）
+        for fetcher in self._get_fetchers_snapshot():
+            if not hasattr(fetcher, "get_us_stock_profile"):
+                continue
+            if not self._is_fetcher_available(fetcher, capability="us_stock_profile"):
+                continue
+            try:
+                profile = self._call_fetcher_method(
+                    fetcher, "get_us_stock_profile", symbol,
+                )
+            except Exception as exc:
+                logger.debug(f"[公司简介] {fetcher.name} 获取 {symbol} 失败: {exc}")
+                continue
+            if profile:
+                profile.setdefault("summary_source", "yfinance")
+                cache[symbol] = profile
+                logger.info(f"[公司简介] 从 {fetcher.name} 获取: {symbol}")
+                return profile
+
+        # 全部失败也缓存 None，避免反复重试
+        cache[symbol] = None
+        return None
+
     def get_belong_boards(self, stock_code: str) -> List[Dict[str, Any]]:
         """
         Get stock membership boards through capability probing.

@@ -82,11 +82,69 @@ DEFAULT_US_UNIVERSE: List[str] = [
 ]
 
 
+# 抛出 / 止损 兜底比例（仅当技术位无法给出时使用）
+# - 8% 上方作为粗略止盈线，与默认池里多数大盘股的中期波动幅度匹配
+# - 5% 下方作为粗略止损线，留足日内波动空间但不放任系统性回撤
+_FALLBACK_SELL_TARGET_PCT = 0.08
+_FALLBACK_STOP_LOSS_PCT = 0.05
+
+
+def _pick_sell_target(
+    current_price: float,
+    resistance_levels: Sequence[float],
+) -> float:
+    """
+    选择"抛出点位"（止盈/卖出目标）。
+
+    优先取技术压力位中第一个高于现价的值；若无可用压力位，则按现价上浮
+    `_FALLBACK_SELL_TARGET_PCT` 给出兜底目标，避免下游展示出现 0。
+    """
+    for lvl in resistance_levels or []:
+        try:
+            v = float(lvl)
+        except (TypeError, ValueError):
+            continue
+        if v > current_price > 0:
+            return v
+    if current_price > 0:
+        return current_price * (1.0 + _FALLBACK_SELL_TARGET_PCT)
+    return 0.0
+
+
+def _pick_stop_loss(
+    current_price: float,
+    support_levels: Sequence[float],
+) -> float:
+    """
+    选择止损点位。
+
+    优先取技术支撑位中第一个低于现价的值；若无可用支撑位，则按现价下浮
+    `_FALLBACK_STOP_LOSS_PCT` 给出兜底止损。
+    """
+    for lvl in support_levels or []:
+        try:
+            v = float(lvl)
+        except (TypeError, ValueError):
+            continue
+        if 0 < v < current_price:
+            return v
+    if current_price > 0:
+        return current_price * (1.0 - _FALLBACK_STOP_LOSS_PCT)
+    return 0.0
+
+
 @dataclass
 class ScreenedStock:
     """单只股票筛选结果。"""
 
     code: str
+    # 股票名称（公司全名 / 中文简称，便于一眼识别；可能为空字符串）
+    name: str = ""
+    # 公司简介（行业 + 业务摘要），来自本地中文映射或 yfinance Ticker.info
+    sector: str = ""              # 板块（默认池中文，如"科技"；未命中回退英文如"Technology"）
+    industry: str = ""            # 行业（默认池中文，如"消费电子"；未命中回退英文）
+    summary: str = ""             # 业务摘要（默认池中文一句话；未命中回退 yfinance 英文原文）
+    website: str = ""             # 官网
     signal_score: int = 0
     buy_signal: str = ""
     trend_status: str = ""
@@ -112,6 +170,13 @@ class ScreenedStock:
     # 量能
     volume_status: str = ""
     volume_ratio_5d: float = 0.0
+    # 支撑 / 压力位（原始列表，便于下游消费方自定义渲染）
+    support_levels: List[float] = field(default_factory=list)
+    resistance_levels: List[float] = field(default_factory=list)
+    # 抛出点位（止盈目标）与 止损点位
+    # 优先来源于技术分析的支撑/压力位；缺失时按现价±固定百分比兜底
+    sell_target: float = 0.0
+    stop_loss: float = 0.0
     reasons: List[str] = field(default_factory=list)
     risks: List[str] = field(default_factory=list)
     data_source: str = ""
@@ -122,14 +187,27 @@ class ScreenedStock:
         code: str,
         result: TrendAnalysisResult,
         data_source: str = "",
+        name: str = "",
+        sector: str = "",
+        industry: str = "",
+        summary: str = "",
+        website: str = "",
     ) -> "ScreenedStock":
+        current_price = float(result.current_price or 0.0)
+        resistance_levels = [float(x) for x in (result.resistance_levels or []) if x]
+        support_levels = [float(x) for x in (result.support_levels or []) if x]
         return cls(
             code=code,
+            name=name or "",
+            sector=sector or "",
+            industry=industry or "",
+            summary=summary or "",
+            website=website or "",
             signal_score=int(result.signal_score),
             buy_signal=result.buy_signal.value if isinstance(result.buy_signal, BuySignal)
             else str(result.buy_signal),
             trend_status=result.trend_status.value,
-            current_price=float(result.current_price or 0.0),
+            current_price=current_price,
             ma5=float(result.ma5 or 0.0),
             ma10=float(result.ma10 or 0.0),
             ma20=float(result.ma20 or 0.0),
@@ -147,6 +225,10 @@ class ScreenedStock:
             rsi_signal=result.rsi_signal,
             volume_status=result.volume_status.value,
             volume_ratio_5d=float(result.volume_ratio_5d or 0.0),
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
+            sell_target=_pick_sell_target(current_price, resistance_levels),
+            stop_loss=_pick_stop_loss(current_price, support_levels),
             reasons=list(result.signal_reasons or []),
             risks=list(result.risk_factors or []),
             data_source=data_source,
@@ -221,7 +303,42 @@ class USStockScreener:
             logger.warning("[USScreener] 分析 %s 失败: %s", code, exc)
             return None
 
-        return ScreenedStock.from_analysis(code, result, data_source=source)
+        # 拉取公司简介（板块/行业/业务摘要 + 名称）。
+        # - 优先命中本地中文简介映射（`US_STOCK_PROFILE_CN`，覆盖默认候选池）
+        # - 未命中时 fallback 到 yfinance 英文 `longBusinessSummary`
+        # - 名称字段独立通过 `get_stock_name` 兜底（中文映射优先）
+        # DataFetcherManager 内部对简介结果做了进程级缓存，重复扫描开销可忽略。
+        name = ""
+        sector = ""
+        industry = ""
+        summary = ""
+        website = ""
+        try:
+            profile = self.fetcher_manager.get_us_stock_profile(code)
+        except Exception as exc:  # pragma: no cover - 防御性
+            logger.debug("[USScreener] 获取 %s 公司简介失败: %s", code, exc)
+            profile = None
+
+        if profile:
+            name = profile.get("name") or ""
+            sector = profile.get("sector") or ""
+            industry = profile.get("industry") or ""
+            summary = profile.get("summary") or ""
+            website = profile.get("website") or ""
+
+        if not name:
+            try:
+                name = self.fetcher_manager.get_stock_name(
+                    code, allow_realtime=False
+                ) or ""
+            except Exception as exc:  # pragma: no cover - 防御性
+                logger.debug("[USScreener] 获取 %s 名称失败: %s", code, exc)
+
+        return ScreenedStock.from_analysis(
+            code, result, data_source=source,
+            name=name, sector=sector, industry=industry,
+            summary=summary, website=website,
+        )
 
     def screen(
         self,
